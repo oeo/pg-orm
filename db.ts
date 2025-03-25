@@ -407,6 +407,18 @@ export function defineSchema<S extends SchemaDefinition>(name: string, schema: S
       return document.save();
     },
 
+    async count(query: Partial<DocType> = {}): Promise<number> {
+      const db = await ensureDatabase();
+      const conditions = Object.entries(query).map(([k, v], i) => `data->>'${String(k)}' = $${i+1}`);
+      const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+      
+      const { rows } = await db.query(
+        `SELECT COUNT(*) as count FROM ${name} ${whereClause}`,
+        Object.values(query)
+      );
+      return parseInt(rows[0].count);
+    },
+
     where(field: string & keyof DocType, operator: string | any, value?: any) {
       const conditions: Array<{field: string, op: string, value: any}> = [];
       conditions.push({ field, op: value === undefined ? '=' : operator, value: value === undefined ? operator : value });
@@ -417,6 +429,7 @@ export function defineSchema<S extends SchemaDefinition>(name: string, schema: S
         limit: (limit: number) => QueryBuilder;
         offset: (offset: number) => QueryBuilder;
         execute: () => Promise<Document<DocType>[]>;
+        count: () => Promise<number>;
       };
 
       let sortOptions: SortOptions<DocType> = {};
@@ -470,6 +483,26 @@ export function defineSchema<S extends SchemaDefinition>(name: string, schema: S
           );
 
           return rows.map(row => new Document<DocType>(row.data, schema, name));
+        },
+        count: async () => {
+          const db = await ensureDatabase();
+          const params: any[] = [];
+          const whereClauses = conditions.map(({field, op, value}, i) => {
+            params.push(value);
+            switch(op) {
+              case '=': return `data->>'${field}' = $${i+1}`;
+              case '<': return `(data->>'${field}')::numeric < $${i+1}`;
+              case '>': return `(data->>'${field}')::numeric > $${i+1}`;
+              case 'contains': return `data->>'${field}' LIKE '%' || $${i+1} || '%'`;
+              default: return `data->>'${field}' = $${i+1}`;
+            }
+          });
+
+          const { rows } = await db.query(
+            `SELECT COUNT(*) as count FROM ${name} WHERE ${whereClauses.join(' AND ')}`,
+            params
+          );
+          return parseInt(rows[0].count);
         }
       };
 

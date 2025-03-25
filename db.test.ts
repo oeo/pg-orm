@@ -311,4 +311,34 @@ describe('PostgreSQL ORM', () => {
     expect(queryResult[0].name).toBe('User C');
     expect(queryResult[1].name).toBe('User D');
   });
+
+  test('should handle count operations', async () => {
+    // create test users with different wallet amounts
+    await Promise.all([
+      User.create({ name: 'User A', email: 'a@example.com', wallet: 100 }),
+      User.create({ name: 'User B', email: 'b@example.com', wallet: 200 }),
+      User.create({ name: 'User C', email: 'c@example.com', wallet: 300 }),
+      User.create({ name: 'User D', email: 'd@example.com', wallet: 400 }),
+      User.create({ name: 'User E', email: 'e@example.com', wallet: 500 })
+    ]);
+
+    // test direct count
+    const totalCount = await User.count();
+    expect(totalCount).toBe(5);
+
+    const richCount = await User.count({ wallet: 300 });
+    expect(richCount).toBe(1);
+
+    // test query builder count
+    const builderCount = await User
+      .where('wallet', '>', 200)
+      .count();
+    expect(builderCount).toBe(3);
+
+    const complexCount = await User
+      .where('wallet', '>', 200)
+      .where('wallet', '<', 500)
+      .count();
+    expect(complexCount).toBe(2);
+  });
 }); 
