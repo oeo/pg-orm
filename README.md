@@ -1,3 +1,7 @@
+[![Test & Deploy](../../actions/workflows/main.yml/badge.svg)](../../actions/workflows/main.yml)
+[![TypeScript](https://img.shields.io/badge/TypeScript-007ACC?style=for-the-badge&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![Built with Bun](https://img.shields.io/badge/Built%20with%20Bun-000?style=for-the-badge&logo=bun&logoColor=white)](https://bun.sh)
+
 # pg-orm
 
 A minimalist PostgreSQL ORM that embraces JSON document storage with TypeScript.

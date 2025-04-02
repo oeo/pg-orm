@@ -4,12 +4,19 @@
   "type": "module",
   "devDependencies": {
     "@types/bun": "latest",
-    "@types/pg": "^8.11.11"
+    "@types/pg": "^8.11.11",
+    "prettier": "^3.5.3"
   },
   "peerDependencies": {
     "typescript": "^5"
   },
+  "scripts": {
+    "format": "prettier --write '**/*.ts'",
+    "test": "bun test"
+  },
   "dependencies": {
+    "@types/inflection": "^2.0.0",
+    "inflection": "^3.0.2",
     "nanoid": "^5.1.5",
     "pg": "^8.14.1"
   }
