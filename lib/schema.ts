@@ -221,18 +221,11 @@ export function defineSchema<DocType extends Record<string, any> = any>(
       const finalSql = `UPDATE \"${name}\" ${setClause} ${whereClause}`.trim();
       const finalParams = [...filterParams, ...updateParams];
 
-      // Add logging
-      console.log('>>> [updateOne] SQL:', finalSql);
-      console.log('>>> [updateOne] PARAMS:', finalParams);
-
       try {
         const { rowCount } = await db.query(finalSql, finalParams);
         return { matchedCount: rowCount ?? 0, modifiedCount: rowCount ?? 0 };
       } catch (error) {
-          console.error('Error during updateOne execution:', error);
-          console.error('Failed SQL:', finalSql);
-          console.error('Failed PARAMS:', finalParams);
-          throw error; // Re-throw after logging
+          throw error;
       }
     },
 
@@ -247,7 +240,6 @@ export function defineSchema<DocType extends Record<string, any> = any>(
       const db = await getConnection();
       const jsonField = capturedOptions?.jsonField || 'data';
       const { whereClause, params: filterParams } = mongoToPg.buildWhereClauseAndParams(filter, jsonField);
-      // console.log('>>> updateMany - jsonField:', jsonField, 'Type:', typeof jsonField, 'Update:', JSON.stringify(updateOps));
 
       const setExpressionResult = mongoToPg.buildUpdateSetExpressionAndParams(updateOps, jsonField);
 

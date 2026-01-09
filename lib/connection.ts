@@ -13,12 +13,13 @@ const transactionContext = new AsyncLocalStorage<PoolClient>();
 class DatabaseManager {
   private static instance: Pool | null = null;
   private static schemas = new Map<string, SchemaDefinition>();
+  private static createdSchemas = new Set<string>();
 
   static config: DbConfig = {
     host: process.env.PGHOST || 'localhost',
     port: parseInt(process.env.PGPORT || '5432'),
     database: process.env.PGDATABASE || 'postgres',
-    user: process.env.PGUSER || process.platform === 'win32' ? process.env.USERNAME : process.env.USER,
+    user: process.env.PGUSER || (process.platform === 'win32' ? process.env.USERNAME : process.env.USER),
     password: process.env.PGPASSWORD,
     connectionTimeoutMillis: 5000,
     idleTimeoutMillis: 30000,
@@ -29,10 +30,12 @@ class DatabaseManager {
     this.schemas.set(name, schema);
   }
 
-  private static async createSchemas(db: Pool) {
+  private static async createSchemas(db: Pool | PoolClient) {
     for (const [name] of this.schemas.entries()) {
+      if (this.createdSchemas.has(name)) continue;
+
       await db.query(`
-        CREATE TABLE IF NOT EXISTS ${name} (
+        CREATE TABLE IF NOT EXISTS "${name}" (
           id SERIAL PRIMARY KEY,
           data JSONB NOT NULL,
           created_at TIMESTAMPTZ DEFAULT NOW()
@@ -40,13 +43,18 @@ class DatabaseManager {
       `);
 
       await db.query(`
-        CREATE INDEX IF NOT EXISTS ${name}_id_idx ON ${name} ((data->>'_id'));
+        CREATE INDEX IF NOT EXISTS "${name}_id_idx" ON "${name}" ((data->>'_id'));
       `);
+      
+      this.createdSchemas.add(name);
     }
   }
 
   static async getConnection(): Promise<Pool> {
-    if (this.instance) return this.instance;
+    if (this.instance) {
+      await this.createSchemas(this.instance);
+      return this.instance;
+    }
 
     const tempConfig = { ...this.config, database: 'postgres' };
     const tempPool = new Pool(tempConfig);
