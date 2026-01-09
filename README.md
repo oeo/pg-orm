@@ -1,4 +1,4 @@
-[![Test & Deploy](../../actions/workflows/main.yml/badge.svg)](../../actions/workflows/main.yml)
+[![Test & Deploy](../../actions/workflows/test.yml/badge.svg)](../../actions/workflows/test.yml)
 [![TypeScript](https://img.shields.io/badge/TypeScript-007ACC?style=for-the-badge&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![Built with Bun](https://img.shields.io/badge/Built%20with%20Bun-000?style=for-the-badge&logo=bun&logoColor=white)](https://bun.sh)
 
@@ -35,15 +35,15 @@ bun add pg-orm
 ## Quick Start
 
 ```typescript
-import { pgorm } from 'pg-orm';
+import { defineSchema } from 'pg-orm';
 
 // Define your models
-const User = pgorm.defineSchema('users', {
+const User = defineSchema('users', {
   name: { type: 'string', required: true },
   email: { type: 'string', required: true }
 });
 
-const Lobby = pgorm.defineSchema('lobbies', {
+const Lobby = defineSchema('lobbies', {
   name: { type: 'string', required: true },
   host: { type: 'ref', ref: 'users', required: true }
 });
@@ -73,36 +73,32 @@ Every document is a plain object with automatic fields:
 
 ```typescript
 {
-  _id: string;     // prefixed identifier (e.g., 'user_123')
-  ctime: number;   // creation time
-  mtime: number;   // last modification
-  version: number; // optimistic lock
+  _id: string;        // prefixed identifier (e.g., 'user_123')
+  _ctime: number;     // creation time
+  _mtime: number;     // last modification
+  _vers: number;      // optimistic lock version
+  _deletedAt?: number // soft delete timestamp (optional)
 }
 ```
 
 ### Schemas
 
-Define your data structure with validation:
+Define your data structure with validation and options:
 
 ```typescript
-const Product = pgorm.defineSchema('products', {
+const Product = defineSchema('products', {
   name: { 
     type: 'string', 
     required: true,
     validate: (value) => {
       if (value.length < 3) throw new Error('Name too short');
     }
-  },
-  
-  metadata: {
-    type: 'object',
-    schema: {
-      sku: { 
-        type: 'string',
-        default: async () => `SKU_${Date.now()}`
-      },
-      version: { type: 'number', default: 1 }
-    }
+  }
+}, {
+  softDelete: true, // Enable soft deletes
+  hooks: {
+    preSave: function() { console.log('Saving...'); },
+    postSave: function() { console.log('Saved!'); }
   }
 });
 ```
@@ -113,16 +109,11 @@ Build type-safe queries naturally:
 
 ```typescript
 // Simple queries
-const product = await Product.findById('product_123');
+const product = await Product.find1('product_123');
 const products = await Product.find({ name: 'Gaming Mouse' });
 
-// Complex queries
-const premiumProducts = await Product
-  .where('price', '>', 100)
-  .orWhere('category', 'premium')
-  .sort('name', 'asc')
-  .limit(10)
-  .execute();
+// Find including soft-deleted items
+const allProducts = await Product.find({}, { includeDeleted: true });
 
 // Raw queries with type safety
 interface Stats {
@@ -139,33 +130,58 @@ const stats = await Product.query<Stats>(`
 `, [], { raw: true });
 ```
 
-### References
+### Lifecycle Hooks
 
-Link and populate related documents:
+React to document events at every stage:
 
 ```typescript
-const Game = pgorm.defineSchema('games', {
-  name: { type: 'string', required: true },
-  creator: { type: 'ref', ref: 'users' },
-  players: { 
-    type: 'array', 
-    of: { type: 'ref', ref: 'users' }
+const User = defineSchema('users', schema, {
+  hooks: {
+    preSave: async function() {
+      if (this.isNew()) {
+        this.history = ['Created'];
+      }
+    },
+    postSave: async function() {
+      console.log('User saved:', this._id);
+    },
+    preRemove: async function() {
+      await cleanupUserData(this._id);
+    }
   }
 });
+```
 
-const game = await Game.findById(gameId);
-await game.populate(['creator', 'players']);
+### Soft Deletes
+
+Safely "delete" data without losing it:
+
+```typescript
+const Post = defineSchema('posts', schema, { softDelete: true });
+
+const post = await Post.find1(id);
+await post.remove(); // Sets _deletedAt, record stays in DB
+
+// Regular queries filter out deleted items automatically
+const activePosts = await Post.find({}); 
+
+// Force include deleted items
+const allPosts = await Post.find({}, { includeDeleted: true });
 ```
 
 ### Transactions
 
-Ensure data consistency:
+Ensure data consistency with automatic context propagation:
 
 ```typescript
-await pgorm.transaction(async () => {
+import { transaction } from 'pg-orm';
+
+await transaction(async () => {
+  // All operations inside this callback share the same transaction
+  // automatically via AsyncLocalStorage
   const [user, product] = await Promise.all([
-    User.findById(userId),
-    Product.findById(productId)
+    User.find1(userId),
+    Product.find1(productId)
   ]);
   
   user.wallet -= product.price;

@@ -1,9 +1,13 @@
-import { Pool } from 'pg';
+import { Pool, PoolClient } from 'pg';
 import { EventEmitter } from 'events';
+import { AsyncLocalStorage } from 'async_hooks';
 import type { DbConfig, SchemaDefinition } from './types';
 
 // event system for document changes
 export const events = new EventEmitter();
+
+// transaction context storage
+const transactionContext = new AsyncLocalStorage<PoolClient>();
 
 // database connection management
 class DatabaseManager {
@@ -71,7 +75,9 @@ class DatabaseManager {
   }
 }
 
-export async function getConnection(): Promise<Pool> {
+export async function getConnection(): Promise<Pool | PoolClient> {
+  const client = transactionContext.getStore();
+  if (client) return client;
   return DatabaseManager.getConnection();
 }
 
@@ -81,16 +87,36 @@ export function registerSchema(name: string, schema: SchemaDefinition): void {
 
 // transaction support
 export async function transaction<T>(callback: () => Promise<T>): Promise<T> {
+  const existingClient = transactionContext.getStore();
+  
+  if (existingClient) {
+    // Already in a transaction, reuse it (flattened)
+    // Note: This does not implement SAVEPOINTs, so a failure here rolls back the whole transaction
+    return await callback();
+  }
+
   const db = await DatabaseManager.getConnection();
-  const client = await db.connect();
+  // We know db is a Pool here because getStore() returned undefined
+  const pool = db as Pool; 
+  const client = await pool.connect();
 
   try {
     await client.query('BEGIN');
-    const result = await callback();
-    await client.query('COMMIT');
-    return result;
+    return await transactionContext.run(client, async () => {
+      try {
+        const result = await callback();
+        await client.query('COMMIT');
+        return result;
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      }
+    });
   } catch (error) {
-    await client.query('ROLLBACK');
+    // If BEGIN fails or final ROLLBACK fails (rare)
+    if ((client as any)._connected) { // check if still connected
+        try { await client.query('ROLLBACK'); } catch {}
+    }
     throw error;
   } finally {
     client.release();

@@ -693,7 +693,7 @@ export class MongoToPG {
     // Use JSON.stringify for robust quoting of path segments
     const segments = fieldPath.split('.').map(p => JSON.stringify(p)); 
     // Return the literal directly, wrapped in single quotes for SQL
-    return `'{'${segments.join(',')}'}'`;
+    return `'{${segments.join(',')}}'`;
   }
 
   #buildJsonbAccessPath(fieldPath: string, jsonField: string): string {

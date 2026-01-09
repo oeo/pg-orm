@@ -47,7 +47,7 @@ export function defineSchema<DocType extends Record<string, any> = any>(
   }
 
   const createDocument = (data: Partial<DocType>) => {
-    return new Document<DocType>(data, schema, name, hooks);
+    return new Document<DocType>(data, schema, name, capturedOptions);
   };
   
   const createDocumentFromRow = (data: any) => {
@@ -55,16 +55,21 @@ export function defineSchema<DocType extends Record<string, any> = any>(
         console.error('[createDocumentFromRow] Error: Received null/undefined data input.');
         throw new Error('Cannot create document from null or undefined data.');
     }
-    return new Document<DocType>(data, schema, name, hooks);
+    return new Document<DocType>(data, schema, name, capturedOptions);
   };
 
   return {
     async find1(id: string): Promise<Document<DocType> | null> {
       const db = await getConnection();
-      const { rows } = await db.query(
-        `SELECT data FROM "${name}" WHERE data->>'_id' = $1 LIMIT 1`,
-        [id]
-      );
+      let sql = `SELECT data FROM "${name}" WHERE data->>'_id' = $1`;
+      
+      if (capturedOptions.softDelete) {
+        sql += ` AND data->>'_deletedAt' IS NULL`;
+      }
+      
+      sql += ` LIMIT 1`;
+      
+      const { rows } = await db.query(sql, [id]);
       return rows[0] ? createDocumentFromRow(rows[0].data) : null;
     },
 
@@ -97,8 +102,8 @@ export function defineSchema<DocType extends Record<string, any> = any>(
       }
     },
 
-    async findOne(mongoQuery: Record<string, any> = {}): Promise<Document<DocType> | null> {
-      const results = await this.find(mongoQuery, { limit: 1 });
+    async findOne(mongoQuery: Record<string, any> = {}, options?: FindOptions<DocType>): Promise<Document<DocType> | null> {
+      const results = await this.find(mongoQuery, { ...options, limit: 1 });
       return results[0] || null;
     },
 
@@ -114,7 +119,14 @@ export function defineSchema<DocType extends Record<string, any> = any>(
         sort: options.sort as Record<string, SortDirection> | undefined
       };
       
-      const { sql, params } = mongoToPg.buildSelectQueryAndParams(name, mongoQuery, converterOptions);
+      const effectiveQuery = { ...mongoQuery };
+      if (capturedOptions.softDelete && !options.includeDeleted) {
+        if (effectiveQuery._deletedAt === undefined) {
+            effectiveQuery._deletedAt = null;
+        }
+      }
+      
+      const { sql, params } = mongoToPg.buildSelectQueryAndParams(name, effectiveQuery, converterOptions);
       const { rows } = await db.query(sql, params);
       return rows.map(row => createDocumentFromRow(row.data));
     },
@@ -125,10 +137,18 @@ export function defineSchema<DocType extends Record<string, any> = any>(
       return document.save();
     },
 
-    async count(mongoQuery: Record<string, any> = {}): Promise<number> {
+    async count(mongoQuery: Record<string, any> = {}, options: FindOptions<DocType> = {}): Promise<number> {
       const db = await getConnection();
       const jsonField = capturedOptions?.jsonField || 'data';
-      const { whereClause, params } = mongoToPg.buildWhereClauseAndParams(mongoQuery, jsonField);
+      
+      const effectiveQuery = { ...mongoQuery };
+      if (capturedOptions.softDelete && !options.includeDeleted) {
+         if (effectiveQuery._deletedAt === undefined) {
+             effectiveQuery._deletedAt = null;
+         }
+      }
+
+      const { whereClause, params } = mongoToPg.buildWhereClauseAndParams(effectiveQuery, jsonField);
       const countSql = `SELECT COUNT(*) as count FROM \"${name}\" ${whereClause}`.trim();
       const { rows } = await db.query(countSql, params);
       return parseInt(rows[0].count);
@@ -140,12 +160,36 @@ export function defineSchema<DocType extends Record<string, any> = any>(
       }
       const db = await getConnection();
       const jsonField = capturedOptions?.jsonField || 'data';
-      const { whereClause, params } = mongoToPg.buildWhereClauseAndParams(mongoQuery, jsonField);
+      
+      // For bulk remove, we typically want to affect only non-deleted items if soft delete is on, unless specified?
+      // Typically remove() deletes from the visible set.
+      const effectiveQuery = { ...mongoQuery };
+      if (capturedOptions.softDelete) {
+         if (effectiveQuery._deletedAt === undefined) {
+             effectiveQuery._deletedAt = null;
+         }
+      }
+
+      const { whereClause, params } = mongoToPg.buildWhereClauseAndParams(effectiveQuery, jsonField);
       if (!whereClause) {
         throw new Error('Could not construct WHERE clause for remove. Aborting to prevent deleting all.');
       }
-      const deleteSql = `DELETE FROM \"${name}\" ${whereClause}`.trim();
-      const { rowCount } = await db.query(deleteSql, params);
+      
+      let querySql: string;
+      let queryParams = params;
+
+      if (capturedOptions.softDelete) {
+          // Perform Soft Delete (Update)
+          const now = Date.now();
+          // We need to inject the update logic.
+          // UPDATE "table" SET data = jsonb_set(data, '{_deletedAt}', to_jsonb(now)) WHERE ...
+          querySql = `UPDATE "${name}" SET data = jsonb_set(data, '{_deletedAt}', to_jsonb($${params.length + 1}::numeric)) ${whereClause}`;
+          queryParams = [...params, now];
+      } else {
+          querySql = `DELETE FROM \"${name}\" ${whereClause}`.trim();
+      }
+
+      const { rowCount } = await db.query(querySql, queryParams);
       return { deletedCount: rowCount ?? 0 };
     },
 

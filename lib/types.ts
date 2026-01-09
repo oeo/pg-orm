@@ -60,6 +60,7 @@ export type FindOptions<T> = {
   sort?: SortOptions<T>;
   limit?: number;
   offset?: number;
+  includeDeleted?: boolean;
 };
 
 // database config type
@@ -67,15 +68,22 @@ export type DbConfig = PoolConfig;
 
 // hook types
 export type PreSaveHook<T> = (this: Document<T>) => Promise<void> | void;
+export type PostSaveHook<T> = (this: Document<T>) => Promise<void> | void;
+export type PreRemoveHook<T> = (this: Document<T>) => Promise<void> | void;
+export type PostRemoveHook<T> = (this: Document<T>) => Promise<void> | void;
+
 export type SchemaHooks<T> = {
   preSave?: PreSaveHook<T>;
-  // potentially add other hooks like postSave, preRemove etc. here
+  postSave?: PostSaveHook<T>;
+  preRemove?: PreRemoveHook<T>;
+  postRemove?: PostRemoveHook<T>;
 };
 
 // Schema options type
 export type SchemaOptions = {
   jsonField?: string;
   hooks?: SchemaHooks<any>; // Use 'any' here, specific type will be inferred in defineSchema
+  softDelete?: boolean;
 };
 
 // Represents the static methods returned by defineSchema

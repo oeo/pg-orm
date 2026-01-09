@@ -1,5 +1,5 @@
 import { nanoid } from 'nanoid';
-import type { SchemaDefinition, SchemaHooks } from './types';
+import type { SchemaDefinition, SchemaOptions } from './types';
 import { getConnection } from './connection';
 import { events } from './connection';
 import { singularize } from './utils';
@@ -24,14 +24,14 @@ export class Document<T> {
   #schema: SchemaDefinition;
   #collectionName: string;
   #originalVersion?: number;
-  #hooks?: SchemaHooks<T>;
+  #options?: SchemaOptions;
   #modifiedPaths: Set<string> = new Set();
 
   constructor(
     data: Partial<T>, 
     schema: SchemaDefinition, 
     collectionName: string,
-    hooks?: SchemaHooks<T>
+    options?: SchemaOptions
   ) {
     Object.assign(this, data);
     this.#schema = schema;
@@ -39,7 +39,7 @@ export class Document<T> {
     this.#originalVersion = (typeof (data as any)._vers === 'number' && (data as any)._vers > 0) 
                               ? (data as any)._vers 
                               : undefined;
-    this.#hooks = hooks;
+    this.#options = options;
     
     if (this._id === undefined) {
       this._id = generateId(collectionName);
@@ -89,7 +89,7 @@ export class Document<T> {
   }
 
   toJSON() {
-    const baseFields = ['_id', '_vers', '_ctime', '_mtime'];
+    const baseFields = ['_id', '_vers', '_ctime', '_mtime', '_deletedAt'];
     const schemaFields = Object.keys(this.#schema);
     const allowedKeys = new Set([...baseFields, ...schemaFields]);
     return Object.fromEntries(
@@ -131,9 +131,9 @@ export class Document<T> {
     // Use the helper method now
     const isUpdate = !this.isNew();
 
-    if (this.#hooks?.preSave) {
+    if (this.#options?.hooks?.preSave) {
       // The hook can now call this.isNew() or this.isModified()
-      await Promise.resolve(this.#hooks.preSave.call(this));
+      await Promise.resolve(this.#options.hooks.preSave.call(this));
     }
 
     if (isUpdate) {
@@ -202,6 +202,10 @@ export class Document<T> {
       this.#_populated = {};
       this.#modifiedPaths.clear();
       events.emit(`${this.#collectionName}:created`, this);
+    }
+
+    if (this.#options?.hooks?.postSave) {
+      await Promise.resolve(this.#options.hooks.postSave.call(this));
     }
 
     return this;
@@ -313,11 +317,39 @@ export class Document<T> {
 
   async remove(): Promise<void> {
     const db = await getConnection();
-    await db.query(
-      `DELETE FROM ${this.#collectionName} WHERE data->>'_id' = $1`,
-      [this._id]
-    );
+
+    if (this.#options?.hooks?.preRemove) {
+      await Promise.resolve(this.#options.hooks.preRemove.call(this));
+    }
+
+    if (this.#options?.softDelete) {
+      this._deletedAt = Date.now();
+      const saveData = this.toJSON();
+      
+      // Update the document to set _deletedAt
+      // We don't increment version for delete as it's a "terminal" state in some views, but technically it's an update.
+      // Let's treat it as a special update that doesn't necessarily need strict version checks if we consider it a delete?
+      // No, for consistency, we should probably check version if we want to be safe, but typically delete is "delete whatever matches ID".
+      // However, if we soft delete, it IS an update.
+      // Let's do a simple update by ID.
+      
+      await db.query(
+        `UPDATE ${this.#collectionName} SET data = $1 WHERE data->>'_id' = $2`,
+        [saveData, this._id]
+      );
+    } else {
+      await db.query(
+        `DELETE FROM ${this.#collectionName} WHERE data->>'_id' = $1`,
+        [this._id]
+      );
+    }
+    
     events.emit(`${this.#collectionName}:removed`, this);
+
+    if (this.#options?.hooks?.postRemove) {
+      await Promise.resolve(this.#options.hooks.postRemove.call(this));
+    }
+    
     Object.freeze(this);
   }
 } 

@@ -9,7 +9,15 @@ import type { SchemaDefinition, InferSchemaType } from '../lib/types';
 const UserSchema: SchemaDefinition = {
   name: { type: 'string', required: true },
   email: { type: 'string', required: true },
-  wallet: { type: 'number', default: 0 }
+  wallet: { type: 'number', default: 0 },
+  profile: { 
+    type: 'object', 
+    schema: {
+      level: { type: 'number', default: 1 },
+      score: { type: 'number', default: 0 }
+    },
+    default: {} 
+  }
 };
 const User = defineSchema<typeof UserSchema>('users', UserSchema);
 type UserDocType = InferSchemaType<typeof UserSchema>;

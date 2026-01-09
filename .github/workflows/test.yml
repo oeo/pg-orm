@@ -2,25 +2,46 @@ name: CI Tests
 
 on:
   push:
-    branches: [ master, main ] # Adjust branches if needed
+    branches: [ master, main ]
   pull_request:
-    branches: [ master, main ] # Adjust branches if needed
+    branches: [ master, main ]
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: myapp
+          POSTGRES_PASSWORD: secret
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
     - name: Set up Bun
-      uses: oven-sh/setup-bun@v1
+      uses: oven-sh/setup-bun@v2
       with:
-        bun-version: latest # or specify a version
+        bun-version: latest
 
     - name: Install dependencies
       run: bun install
 
     - name: Run tests
-      run: bun test 
+      run: bun test
+      env:
+        PGHOST: localhost
+        PGPORT: 5432
+        PGDATABASE: myapp
+        PGUSER: postgres
+        PGPASSWORD: secret

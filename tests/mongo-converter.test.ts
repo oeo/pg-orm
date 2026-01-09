@@ -716,10 +716,11 @@ describe('MongoToPG', () => {
   test('Empty/Null Edge: $in with mixed types and null', () => {
     const query = { values: { $in: [1, 'two', null, 3.0] } };
     // Expect outer parentheses around combined OR, separate ANY for types
-    const expectedSql = `SELECT "data" FROM "mixed" WHERE (((data->>'values')::integer = ANY($1) OR (data->>'values')::numeric = ANY($2) OR data->>'values' = ANY($3)) OR (data->'values' IS NULL OR data->'values' = 'null'::jsonb))`;
+    // Note: 3.0 is treated as integer 3 in JS, so it goes into the integer bucket
+    const expectedSql = `SELECT "data" FROM "mixed" WHERE ((((data->>'values')::integer = ANY($1) OR data->>'values' = ANY($2))) OR (data->'values' IS NULL OR data->'values' = 'null'::jsonb))`;
     const { sql, params } = converter.buildSelectQueryAndParams('mixed', query);
     expect(sql).toBe(expectedSql);
-    expect(params).toEqual([[1], [3.0], ['two']]); 
+    expect(params).toEqual([[1, 3], ['two']]); 
   });
 
   test('Empty/Null Edge: $eq empty object', () => {
