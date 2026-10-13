@@ -236,15 +236,11 @@ export class MongoToPG {
           if (typeof increment !== "number")
             throw new QueryError(`$inc ${fieldPath} must be a number`);
           const pathArray = this.#buildJsonbPath(fieldPath);
-          const parts = fieldPath.split(".");
-          let currentAccessPath = this.#quoteIdent(jsonField);
-          for (let i = 0; i < parts.length; i++) {
-            const part = parts[i];
-            const quotedPart = this.#quoteLiteral(part);
-            currentAccessPath += `->${quotedPart}`;
-          }
+          // read through the same path the write uses, so a numeric segment
+          // addresses an array element in both
+          const stored = `(${this.#quoteIdent(jsonField)} #>> ${pathArray})::numeric`;
           const incrementPlaceholder = this.#addParam(increment);
-          const incrementExpression = `to_jsonb(COALESCE((${currentAccessPath})::numeric, 0) + ${incrementPlaceholder}::numeric)`;
+          const incrementExpression = `to_jsonb(COALESCE(${stored}, 0) + ${incrementPlaceholder}::numeric)`;
           // Use jsonb_set_lax here too for consistency and potential nested increments
           currentExpression = `jsonb_set_lax(${currentExpression}::jsonb, ${pathArray}, ${incrementExpression}, true)`;
           appliedOps++;
@@ -1050,10 +1046,6 @@ export class MongoToPG {
 
   #quoteIdent(ident: string): string {
     return `"${ident.replace(/"/g, '""')}"`;
-  }
-
-  #quoteLiteral(value: string): string {
-    return `'${value.replace(/'/g, "''")}'`;
   }
 
   // escape a user-supplied JSON key for safe interpolation between single
