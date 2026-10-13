@@ -30,8 +30,11 @@ A minimalist PostgreSQL ORM that embraces JSON document storage with TypeScript.
 ## Installation
 
 ```bash
-bun add pg-orm
+bun add github:oeo/pg-orm
 ```
+
+Install from GitHub. The `pg-orm` name on npm belongs to an unrelated
+package. The library ships as TypeScript source and is run with Bun.
 
 ## Quick Start
 
@@ -75,10 +78,10 @@ Every document is a plain object with automatic fields:
 ```typescript
 {
   _id: string;        // prefixed identifier (e.g., 'user_123')
-  _ctime: number;     // creation time
-  _mtime: number;     // last modification
+  _ctime: number;     // creation time, milliseconds since the epoch
+  _mtime: number;     // last modification, milliseconds since the epoch
   _vers: number;      // optimistic lock version
-  _deletedAt?: number // soft delete timestamp (optional)
+  _deletedAt?: number // soft delete time in milliseconds (optional)
 }
 ```
 
@@ -195,11 +198,18 @@ await transaction(async () => {
 });
 ```
 
+A nested `transaction()` joins the outer one; there are no savepoints.
+`inTransaction()` reports whether one is active, and
+`withoutTransaction(callback)` runs work outside it, for example a
+fire-and-forget task started from a hook.
+
 ### Events
 
 React to changes:
 
 ```typescript
+import { pgorm } from 'pg-orm';
+
 pgorm.events.on('products:created', (product) => {
   console.log('New product:', product.name);
 });
@@ -229,9 +239,12 @@ await transaction(async () => {
 ### Bulk Updates and Queue Claims
 
 `updateOne` and `updateMany` accept `$set`, `$inc`, `$min`, and
-`$setIfNull`. They skip hooks and do not change `_vers`. With `sort`,
-`limit`, or `lock`, `updateMany` updates only the selected rows in one
-statement:
+`$setIfNull`. They skip hooks and events, and do not change `_vers` or
+`_mtime`. On a soft-delete schema they also update soft-deleted rows.
+`updateOne` updates every row the filter matches, not only the first.
+
+With `sort`, `limit`, or `lock`, `updateMany` updates only the selected rows
+in one statement:
 
 ```typescript
 const { documents } = await Job.updateMany(
@@ -331,19 +344,20 @@ These differ from earlier versions:
 
 ## Environment
 
-```bash
-# Required
-PGHOST=localhost
-PGPORT=5432
-PGDATABASE=myapp
-PGUSER=postgres
-PGPASSWORD=secret
+The connection reads the standard Postgres variables. Each has a default:
 
-# Optional
-PG_POOL_MAX=20
-PG_POOL_IDLE_TIMEOUT=30000
-PG_POOL_CONNECTION_TIMEOUT=5000
+```bash
+PGHOST=localhost      # default localhost
+PGPORT=5432           # default 5432
+PGDATABASE=myapp      # default postgres
+PGUSER=postgres       # default: your OS user
+PGPASSWORD=secret     # default: none
 ```
+
+The database is created if it does not exist, and each schema's table is
+created on first use. The pool is fixed at 20 connections, a 30 second idle
+timeout, and a 5 second connection timeout; no environment variable changes
+it.
 
 ## License
 
