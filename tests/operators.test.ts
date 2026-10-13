@@ -2,7 +2,7 @@
 // numeric sort order and the comparison operands that are bound as parameters.
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { defineSchema, QueryError } from "../lib";
+import { defineSchema, getConnection, QueryError } from "../lib";
 
 const Probe = defineSchema("orm_operator_probe", {
   label: { type: "string", required: true },
@@ -17,10 +17,15 @@ beforeAll(async () => {
   await Probe.remove({ _id: { $exists: true } });
   const rows = [
     { label: "a", count: 9, tags: ["x"], meta: { "o'k": "x" } },
-    { label: "b", count: 80, tags: ["x", "y"] },
-    { label: "c", count: 100, tags: ["y"] },
+    { label: "b", count: 80, tags: ["x", "y"], meta: { list: [1, null] } },
+    { label: "c", count: 100, tags: ["y"], meta: { list: [5, 7] } },
     { label: "d", count: 5, tags: [] },
-    { label: "e", count: 1000, tags: ["x", "y", "z"] },
+    {
+      label: "e",
+      count: 1000,
+      tags: ["x", "y", "z"],
+      meta: { grid: [[1, 2], [9]] },
+    },
   ];
   for (const row of rows) await Probe.create(row);
 });
@@ -78,6 +83,49 @@ describe("bound operands", () => {
         await Probe.find({ $or: [{ label: "a" }, { tags: { $in: [] } }] }),
       ),
     ).toEqual(["a"]);
+  });
+
+  test("a primitive $elemMatch reads each element", async () => {
+    const find = async (operand: Record<string, any>) =>
+      labels(await Probe.find({ "meta.list": { $elemMatch: operand } }));
+
+    expect(await find({ $eq: null })).toEqual(["b"]);
+    expect(await find({ $type: "number" })).toEqual(["b", "c"]);
+    expect(await find({ $gt: 4, $lt: 6 })).toEqual(["c"]);
+    expect(await find({ $in: [null, 7] })).toEqual(["b", "c"]);
+    expect(
+      labels(await Probe.find({ tags: { $elemMatch: { $eq: "z" } } })),
+    ).toEqual(["e"]);
+  });
+
+  test("a nested primitive $elemMatch reads the inner array", async () => {
+    const find = async (inner: Record<string, any>) =>
+      labels(
+        await Probe.find({
+          "meta.grid": { $elemMatch: { $elemMatch: inner } },
+        }),
+      );
+
+    expect(await find({ $gt: 8 })).toEqual(["e"]);
+    expect(await find({ $gt: 9 })).toEqual([]);
+  });
+
+  test("an update key holding $ and digits is written as given", async () => {
+    await Probe.updateOne({ label: "d" }, { $set: { a$10b: 1 } });
+    await Probe.updateMany(
+      { label: "d", count: 5 },
+      { $inc: { a$10b: 2 } },
+      { limit: 1 },
+    );
+    const db = await getConnection();
+    const { rows } = await db.query(
+      `SELECT data - '_mtime' AS doc FROM orm_operator_probe WHERE data->>'label' = 'd'`,
+    );
+    // the old placeholder renumbering wrote a$11b and a$12b instead
+    expect(rows[0].doc.a$10b).toBe(3);
+    expect(
+      Object.keys(rows[0].doc).filter((key) => key.startsWith("a$")),
+    ).toEqual(["a$10b"]);
   });
 
   test("a quote in a dotted key keeps its parent path", async () => {

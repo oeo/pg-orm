@@ -17,7 +17,6 @@ import type {
   UpdateManyOptions,
   UpdateResult,
 } from "./types";
-import { renumberPlaceholders } from "./utils";
 
 export function defineSchema<DocType extends Record<string, any> = any>(
   name: string,
@@ -361,6 +360,7 @@ export function defineSchema<DocType extends Record<string, any> = any>(
       const setExpressionResult = mongoToPg.buildUpdateSetExpressionAndParams(
         updateOps,
         jsonField,
+        filterParams,
       );
 
       if (!setExpressionResult) {
@@ -371,13 +371,11 @@ export function defineSchema<DocType extends Record<string, any> = any>(
         return { matchedCount: parseInt(rows[0].count, 10), modifiedCount: 0 };
       }
 
-      const { expression: setExpression, params: updateParams } =
+      const { expression: setExpression, params: finalParams } =
         setExpressionResult;
 
-      // Construct final query parts
-      const setClause = `SET ${jsonField} = ${renumberPlaceholders(setExpression, filterParams.length)}`;
-      const finalSql = `UPDATE "${name}" ${setClause} ${whereClause}`.trim();
-      const finalParams = [...filterParams, ...updateParams];
+      const finalSql =
+        `UPDATE "${name}" SET ${jsonField} = ${setExpression} ${whereClause}`.trim();
       const { rowCount } = await db.query(finalSql, finalParams);
       return { matchedCount: rowCount ?? 0, modifiedCount: rowCount ?? 0 };
     },
@@ -413,22 +411,6 @@ export function defineSchema<DocType extends Record<string, any> = any>(
         mongoToPg.buildWhereClauseAndParams(filter, jsonField);
       requireSelective(whereClause, "updateMany");
 
-      const setExpressionResult = mongoToPg.buildUpdateSetExpressionAndParams(
-        updateOps,
-        jsonField,
-      );
-
-      if (!setExpressionResult) {
-        console.warn("[updateMany] No valid update operators found.");
-        const countSql =
-          `SELECT COUNT(*) as count FROM "${name}" ${whereClause}`.trim();
-        const { rows } = await db.query(countSql, filterParams);
-        return { matchedCount: parseInt(rows[0].count, 10), modifiedCount: 0 };
-      }
-
-      const { expression: setExpression, params: updateParams } =
-        setExpressionResult;
-
       let target = whereClause;
       let targetParams = filterParams;
       if (options.sort || options.limit !== undefined || options.lock) {
@@ -448,9 +430,25 @@ export function defineSchema<DocType extends Record<string, any> = any>(
         targetParams = picked.params;
       }
 
+      const setExpressionResult = mongoToPg.buildUpdateSetExpressionAndParams(
+        updateOps,
+        jsonField,
+        targetParams,
+      );
+
+      if (!setExpressionResult) {
+        console.warn("[updateMany] No valid update operators found.");
+        const countSql =
+          `SELECT COUNT(*) as count FROM "${name}" ${whereClause}`.trim();
+        const { rows } = await db.query(countSql, filterParams);
+        return { matchedCount: parseInt(rows[0].count, 10), modifiedCount: 0 };
+      }
+
+      const { expression: setExpression, params: finalParams } =
+        setExpressionResult;
+
       const finalSql =
-        `UPDATE "${name}" SET data = ${renumberPlaceholders(setExpression, targetParams.length)} ${target}${options.returning ? " RETURNING data" : ""}`.trim();
-      const finalParams = [...targetParams, ...updateParams];
+        `UPDATE "${name}" SET ${jsonField} = ${setExpression} ${target}${options.returning ? ` RETURNING ${jsonField}` : ""}`.trim();
 
       const { rows, rowCount } = await db.query(finalSql, finalParams);
 
@@ -458,7 +456,11 @@ export function defineSchema<DocType extends Record<string, any> = any>(
         matchedCount: rowCount ?? 0,
         modifiedCount: rowCount ?? 0,
         ...(options.returning
-          ? { documents: rows.map((row) => createDocumentFromRow(row.data)) }
+          ? {
+              documents: rows.map((row) =>
+                createDocumentFromRow(row[jsonField]),
+              ),
+            }
           : {}),
       };
     },
