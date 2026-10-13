@@ -339,7 +339,14 @@ export function defineSchema<DocType extends Record<string, any> = any>(
     },
 
     /**
-     * Updates a single document matching the filter using parameterization.
+     * Updates one document matching the filter, using parameterization. Which
+     * one is unspecified when several match. The filter also stays on the
+     * UPDATE itself, so a compare-and-set such as
+     * `updateOne({ _id, state: "old" }, ...)` is rechecked against a
+     * concurrent writer and reports modifiedCount 0. For the same reason,
+     * when a concurrent writer changes the chosen row so it no longer
+     * matches, the result is 0 even if other rows still match; to claim work
+     * from a queue use updateMany with `limit` and `lock: "skipLocked"`.
      */
     async updateOne(
       filter: Record<string, any>,
@@ -365,17 +372,18 @@ export function defineSchema<DocType extends Record<string, any> = any>(
 
       if (!setExpressionResult) {
         console.warn("[updateOne] No valid update operators found.");
-        const countSql =
-          `SELECT COUNT(*) as count FROM "${name}" ${whereClause}`.trim();
-        const { rows } = await db.query(countSql, filterParams);
-        return { matchedCount: parseInt(rows[0].count, 10), modifiedCount: 0 };
+        const { rowCount } = await db.query(
+          `SELECT 1 FROM "${name}" ${whereClause} LIMIT 1`,
+          filterParams,
+        );
+        return { matchedCount: rowCount ?? 0, modifiedCount: 0 };
       }
 
       const { expression: setExpression, params: finalParams } =
         setExpressionResult;
 
-      const finalSql =
-        `UPDATE "${name}" SET ${jsonField} = ${setExpression} ${whereClause}`.trim();
+      const condition = whereClause.slice("WHERE ".length);
+      const finalSql = `UPDATE "${name}" SET ${jsonField} = ${setExpression} WHERE (${condition}) AND id = (SELECT id FROM "${name}" ${whereClause} LIMIT 1)`;
       const { rowCount } = await db.query(finalSql, finalParams);
       return { matchedCount: rowCount ?? 0, modifiedCount: rowCount ?? 0 };
     },

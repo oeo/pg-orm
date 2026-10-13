@@ -992,7 +992,7 @@ describe("MongoToPG", () => {
       ["p1", "p2"],
     );
     expect(built?.expression).toBe(
-      `jsonb_set_lax(jsonb_set_lax("data"::jsonb, '{"a$10b"}', $3::jsonb, true)::jsonb, '{"n","$1"}', to_jsonb(COALESCE(("data"->'n'->'$1')::numeric, 0) + $4::numeric), true)`,
+      `jsonb_set_lax(jsonb_set_lax("data"::jsonb, '{"a$10b"}', $3::jsonb, true)::jsonb, '{"n","$1"}', to_jsonb(COALESCE(("data" #>> '{"n","$1"}')::numeric, 0) + $4::numeric), true)`,
     );
     expect(built?.params).toEqual(["p1", "p2", "1", 2]);
   });

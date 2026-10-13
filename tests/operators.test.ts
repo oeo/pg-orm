@@ -128,6 +128,19 @@ describe("bound operands", () => {
     ).toEqual(["a$10b"]);
   });
 
+  test("$inc on an array index adds to the element", async () => {
+    await Probe.updateMany(
+      { label: "c" },
+      { $inc: { "meta.list.0": 10, "meta.list.1": -2, "meta.hits": 1 } },
+    );
+    const [row] = await Probe.find({ label: "c" });
+    expect(row.meta).toEqual({ list: [15, 5], hits: 1 });
+    await Probe.updateMany(
+      { label: "c" },
+      { $inc: { "meta.list.0": -10, "meta.list.1": 2 } },
+    );
+  });
+
   test("a quote in a dotted key keeps its parent path", async () => {
     expect(labels(await Probe.find({ "meta.o'k": "x" }))).toEqual(["a"]);
   });
@@ -168,5 +181,80 @@ describe("bulk writes refuse a filter that selects every row by construction", (
       { $set: { seen: true } },
     );
     expect(result.modifiedCount).toBe(5);
+  });
+});
+
+describe("updateOne", () => {
+  const Rows = defineSchema("orm_update_one_probe", {
+    group: { type: "string", required: true },
+    state: { type: "string" },
+    n: { type: "number", default: 0 },
+  });
+
+  beforeAll(async () => {
+    await Rows.remove({ _id: { $exists: true } });
+    for (const n of [1, 2, 3])
+      await Rows.create({ group: "g", state: "new", n });
+  });
+
+  afterAll(async () => {
+    await Rows.remove({ _id: { $exists: true } });
+  });
+
+  test("updates exactly one of several matching rows", async () => {
+    const result = await Rows.updateOne({ group: "g" }, { $inc: { n: 100 } });
+    expect(result).toEqual({ matchedCount: 1, modifiedCount: 1 });
+    const rows = await Rows.find({ group: "g" });
+    expect(rows.filter((row) => row.n > 100)).toHaveLength(1);
+    expect(rows.reduce((sum, row) => sum + row.n, 0)).toBe(106);
+  });
+
+  test("reports zero when nothing matches or no operator applies", async () => {
+    expect(await Rows.updateOne({ group: "none" }, { $set: { n: 9 } })).toEqual(
+      { matchedCount: 0, modifiedCount: 0 },
+    );
+    expect(await Rows.updateOne({ group: "g" }, {})).toEqual({
+      matchedCount: 1,
+      modifiedCount: 0,
+    });
+  });
+
+  test("a compare-and-set has exactly one winner under concurrency", async () => {
+    const doc = await Rows.create({ group: "cas", state: "old" });
+    const attempts = await Promise.all(
+      Array.from({ length: 8 }, (_, i) =>
+        Rows.updateOne(
+          { _id: doc._id, state: "old" },
+          { $set: { state: `claimed-${i}` } },
+        ),
+      ),
+    );
+    expect(
+      attempts.filter((result) => result.modifiedCount === 1),
+    ).toHaveLength(1);
+  });
+
+  test("$inc treats a stored null as 0 and adds to a numeric string", async () => {
+    const doc = await Rows.create({ group: "inc" });
+    await Rows.updateOne(
+      { _id: doc._id },
+      { $set: { text: "5", empty: null } },
+    );
+    await Rows.updateOne({ _id: doc._id }, { $inc: { text: 1, empty: 2 } });
+    const db = await getConnection();
+    const { rows } = await db.query(
+      `SELECT data->'text' AS text, data->'empty' AS empty FROM orm_update_one_probe WHERE data->>'_id' = $1`,
+      [doc._id],
+    );
+    expect(rows[0]).toEqual({ text: 6, empty: 2 });
+  });
+
+  test("a filter with a top-level $or still updates one row", async () => {
+    const result = await Rows.updateOne(
+      { $or: [{ n: 2 }, { n: 3 }] },
+      { $set: { state: "picked" } },
+    );
+    expect(result.modifiedCount).toBe(1);
+    expect(await Rows.count({ state: "picked" })).toBe(1);
   });
 });

@@ -241,7 +241,10 @@ await transaction(async () => {
 `updateOne` and `updateMany` accept `$set`, `$inc`, `$min`, and
 `$setIfNull`. They skip hooks and events, and do not change `_vers` or
 `_mtime`. On a soft-delete schema they also update soft-deleted rows.
-`updateOne` updates every row the filter matches, not only the first.
+`updateOne` updates one row the filter matches; `updateMany` updates all of
+them. When another writer changes the chosen row so it no longer matches,
+`updateOne` reports `modifiedCount: 0` even if other rows still match, so
+claim queued work with `updateMany` and `lock: 'skipLocked'` as below.
 
 With `sort`, `limit`, or `lock`, `updateMany` updates only the selected rows
 in one statement:
@@ -333,6 +336,13 @@ These differ from earlier versions:
   element. `$eq: null` matches only arrays that contain null; it used to
   match every non-empty array. `$exists`, `$type`, `$size`, and a nested
   `$elemMatch` now work there.
+- `updateOne` updates one row. It used to update every row the filter
+  matched. With no valid update operator its `matchedCount` is 0 or 1.
+- `$inc` on an array index, such as `{ $inc: { "scores.0": 5 } }`, adds to
+  the element. It used to replace it with the increment. `$inc` also treats
+  a stored JSON null as 0 and adds to a stored numeric string such as `"5"`.
+  The string used to raise a cast error, and so did the null before
+  PostgreSQL 18.
 - An update key that contains `$` followed by digits, such as `a$10b`, is
   written as given. It used to be written under a shifted number.
 - Sorting compares JSON values, so numbers order numerically, and documents
