@@ -307,6 +307,14 @@ These differ from earlier versions:
 - Filter operands are bound as parameters instead of written into the SQL
   text, and quotes in filter, sort, and update keys are escaped.
 - `$text` throws without `textFields`. It used to match every row.
+- Malformed operands throw `QueryError` instead of compiling to a constant:
+  a non-array `$in`, `$nin`, or `$all`, a bad `$mod`, `$size`, `$type`,
+  `$elemMatch`, `$not`, or `$exists`, `$options` without `$regex`, and an
+  empty `$and`, `$or`, or `$nor` array. `$all: []` matches nothing.
+- `remove`, `updateOne`, and `updateMany` refuse a filter that selects every
+  row by construction, such as `{ $and: [{}] }` or `{ f: { $nin: [] } }`.
+  Pass a real predicate, for example `{ _id: { $exists: true } }`.
+- `limit` and `offset` must be non-negative integers; `0` means none.
 - Sorting compares JSON values, so numbers order numerically, and documents
   missing the field sort last. It used to compare their text.
 - Events fire after commit with a detached copy of the document. Listeners

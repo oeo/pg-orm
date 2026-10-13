@@ -74,6 +74,16 @@ export function defineSchema<DocType extends Record<string, any> = any>(
       throw new Error(`${name}: lock "${lock}" requires a transaction`);
   };
 
+  // A bulk write whose filter selects every row by construction (no
+  // condition, or a constant TRUE) is refused. To mean every row, pass a real
+  // predicate such as { _id: { $exists: true } }.
+  const requireSelective = (whereClause: string, method: string) => {
+    if (!whereClause || whereClause === "WHERE TRUE")
+      throw new QueryError(
+        `${name}.${method} requires a filter that selects rows`,
+      );
+  };
+
   const createDocumentFromRow = (data: any) => {
     if (!data) {
       console.error(
@@ -291,6 +301,12 @@ export function defineSchema<DocType extends Record<string, any> = any>(
       const db = await getConnection();
       const jsonField = capturedOptions?.jsonField || "data";
 
+      // checked before the soft-delete condition below, which would hide it
+      requireSelective(
+        mongoToPg.buildWhereClauseAndParams(mongoQuery, jsonField).whereClause,
+        "remove",
+      );
+
       // For bulk remove, we typically want to affect only non-deleted items if soft delete is on, unless specified?
       // Typically remove() deletes from the visible set.
       const effectiveQuery = { ...mongoQuery };
@@ -304,11 +320,6 @@ export function defineSchema<DocType extends Record<string, any> = any>(
         effectiveQuery,
         jsonField,
       );
-      if (!whereClause) {
-        throw new Error(
-          "Could not construct WHERE clause for remove. Aborting to prevent deleting all.",
-        );
-      }
 
       let querySql: string;
       let queryParams = params;
@@ -345,6 +356,7 @@ export function defineSchema<DocType extends Record<string, any> = any>(
       const jsonField = capturedOptions?.jsonField || "data";
       const { whereClause, params: filterParams } =
         mongoToPg.buildWhereClauseAndParams(filter, jsonField);
+      requireSelective(whereClause, "updateOne");
 
       const setExpressionResult = mongoToPg.buildUpdateSetExpressionAndParams(
         updateOps,
@@ -399,6 +411,7 @@ export function defineSchema<DocType extends Record<string, any> = any>(
       const jsonField = capturedOptions?.jsonField || "data";
       const { whereClause, params: filterParams } =
         mongoToPg.buildWhereClauseAndParams(filter, jsonField);
+      requireSelective(whereClause, "updateMany");
 
       const setExpressionResult = mongoToPg.buildUpdateSetExpressionAndParams(
         updateOps,

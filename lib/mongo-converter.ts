@@ -91,10 +91,14 @@ export class MongoToPG {
       sqlQuery += ` WHERE ${whereClause}`;
     }
 
+    for (const [option, value] of Object.entries({ limit, offset })) {
+      if (value != null && (!Number.isSafeInteger(value) || value < 0))
+        throw new QueryError(`${option} must be a non-negative integer`);
+    }
     if (sort && Object.keys(sort).length > 0)
       sqlQuery += this.#buildSortClause(sort, jsonField);
-    if (limit !== undefined && limit > 0) sqlQuery += ` LIMIT ${limit}`;
-    if (offset !== undefined && offset > 0) sqlQuery += ` OFFSET ${offset}`; // Handle offset
+    if (limit) sqlQuery += ` LIMIT ${limit}`;
+    if (offset) sqlQuery += ` OFFSET ${offset}`;
     if (options.lock) sqlQuery += ` ${lockClause(options.lock)}`;
 
     return { sql: sqlQuery.trim(), params: this.#params };
@@ -283,10 +287,29 @@ export class MongoToPG {
     return this.#processQueryObject(query, jsonField);
   }
 
+  // A sub-filter that folds to a constant references none of the parameters
+  // bound while compiling it; drop them so placeholders and params stay
+  // aligned.
+  #fold(compile: () => string): string {
+    const mark = this.#params.length;
+    const clause = compile();
+    if (!clause || clause === "TRUE" || clause === "FALSE")
+      this.#params.length = mark;
+    return clause;
+  }
+
   #processQueryObject(
     query: Record<string, any>,
     jsonField: string,
     parentPath = "",
+  ): string {
+    return this.#fold(() => this.#queryObject(query, jsonField, parentPath));
+  }
+
+  #queryObject(
+    query: Record<string, any>,
+    jsonField: string,
+    parentPath: string,
   ): string {
     const clauses: string[] = [];
     let isTrueResult = false;
@@ -308,11 +331,13 @@ export class MongoToPG {
 
       if (this.#isLogicalOperator(key)) {
         const currentJsonFieldContext = parentPath || jsonField;
-        const logicalClause = this.#handleLogicalOperator(
-          key,
-          value,
-          currentJsonFieldContext,
-          parentPath,
+        const logicalClause = this.#fold(() =>
+          this.#handleLogicalOperator(
+            key,
+            value,
+            currentJsonFieldContext,
+            parentPath,
+          ),
         );
         if (logicalClause) {
           // Handle TRUE/FALSE returns from logical operators
@@ -404,7 +429,7 @@ export class MongoToPG {
             const operatorKeys = Object.keys(
               valueObjectForWrappingCheck,
             ).filter((k) => k !== "$options");
-            if (operatorKeys.length > 1) {
+            if (operatorKeys.length > 1 && fieldClause !== "FALSE") {
               fieldClause = `(${fieldClause})`;
             }
           }
@@ -438,27 +463,35 @@ export class MongoToPG {
     accessPath: string,
     jsonPath: string,
   ): string {
+    return this.#fold(() =>
+      this.#fieldOperators(operators, accessPath, jsonPath),
+    );
+  }
+
+  #fieldOperators(
+    operators: Record<string, any>,
+    accessPath: string,
+    jsonPath: string,
+  ): string {
     const fieldClauses: string[] = [];
     let operatorReturnedTrue = false; // Track if any operator returns TRUE
 
+    if ("$options" in operators && !("$regex" in operators))
+      throw new QueryError("$options requires $regex");
+
     for (const [op, operand] of Object.entries(operators)) {
-      if (op === "$not") {
-        // Pass jsonPath correctly for null checks inside $not operand handling
-        const notCondition = this.#handleNotOperator(
-          operand,
-          accessPath,
-          jsonPath,
-        );
-        if (notCondition) fieldClauses.push(notCondition);
-        continue;
-      }
-      const clause = this.#handleComparisonOperator(
-        op,
-        operand,
-        accessPath,
-        jsonPath,
-        operators.$options as string | undefined,
-      );
+      const clause =
+        op === "$not"
+          ? this.#handleNotOperator(operand, accessPath, jsonPath)
+          : this.#handleComparisonOperator(
+              op,
+              operand,
+              accessPath,
+              jsonPath,
+              operators.$options as string | undefined,
+            );
+      // the operators of one field are ANDed, so one FALSE decides
+      if (clause === "FALSE") return "FALSE";
       // Check if the operator returned TRUE
       if (clause === "TRUE") {
         operatorReturnedTrue = true;
@@ -576,7 +609,9 @@ export class MongoToPG {
           : `${accessPath} <= ${bind(operand)}`;
 
       case "$in": {
-        if (!Array.isArray(operand) || operand.length === 0) return "FALSE";
+        if (!Array.isArray(operand))
+          throw new QueryError("$in requires an array");
+        if (operand.length === 0) return "FALSE";
         const hasNull = operand.includes(null);
         const nonNullOperands = operand.filter((v) => v !== null);
         if (nonNullOperands.length === 0) {
@@ -647,11 +682,9 @@ export class MongoToPG {
       }
 
       case "$nin": {
-        // Fix 1: Ensure $nin:[] returns 'TRUE' string
-        if (Array.isArray(operand) && operand.length === 0) {
-          return "TRUE";
-        }
-        if (!Array.isArray(operand)) return "TRUE";
+        if (!Array.isArray(operand))
+          throw new QueryError("$nin requires an array");
+        if (operand.length === 0) return "TRUE";
         const hasNull = operand.includes(null);
         const nonNullOperands = operand.filter((v) => v !== null);
         if (nonNullOperands.length === 0) {
@@ -693,6 +726,8 @@ export class MongoToPG {
       }
 
       case "$exists":
+        if (typeof operand !== "boolean" && operand !== 0 && operand !== 1)
+          throw new QueryError("$exists requires a boolean");
         return operand ? `${jsonPath} IS NOT NULL` : `${jsonPath} IS NULL`;
 
       case "$regex": {
@@ -732,33 +767,31 @@ export class MongoToPG {
         ) {
           return `${numericAccessPath} % ${bind(operand[0])} = ${bind(operand[1])}`;
         }
-        console.warn("Invalid $mod operand: requires [divisor, remainder]");
-        return "FALSE";
+        throw new QueryError("$mod requires [divisor, remainder]");
 
       case "$size":
         if (
           typeof operand !== "number" ||
           !Number.isInteger(operand) ||
           operand < 0
-        ) {
-          console.warn("$size requires a non-negative integer");
-          return "FALSE";
-        }
+        )
+          throw new QueryError("$size requires a non-negative integer");
         return `(jsonb_typeof(${jsonPath}) = 'array' AND jsonb_array_length(${jsonPath}) = ${operand})`;
 
       case "$all":
-        if (!Array.isArray(operand)) {
-          console.warn("$all requires an array operand");
-          return "FALSE";
-        }
-        if (operand.length === 0) return "TRUE";
+        if (!Array.isArray(operand))
+          throw new QueryError("$all requires an array");
+        // an empty $all matches nothing; `@> '[]'` would match every array
+        if (operand.length === 0) return "FALSE";
         return `${jsonPath} @> ${bind(operand)}::jsonb`;
 
       case "$elemMatch": {
-        if (typeof operand !== "object" || operand === null) {
-          console.warn(`Invalid $elemMatch operand: must be an object`);
-          return "FALSE";
-        }
+        if (
+          typeof operand !== "object" ||
+          operand === null ||
+          Array.isArray(operand)
+        )
+          throw new QueryError("$elemMatch requires an object");
 
         const keys = Object.keys(operand);
         const allKeysAreOperators = keys.every((k) => k.startsWith("$"));
@@ -775,14 +808,10 @@ export class MongoToPG {
         if (isPrimitiveMatch) {
           arrayElementsFunc = "jsonb_array_elements_text";
           alias = "elem_val";
-          const primitiveOperator = Object.keys(operand)[0];
-          const primitiveOperand = Object.values(operand)[0];
-          const primitiveAccessPath = `${alias}.value`;
           // Pass null for jsonPath here as we are operating on extracted text primitive
-          elemMatchConditions = this.#handleComparisonOperator(
-            primitiveOperator,
-            primitiveOperand,
-            primitiveAccessPath,
+          elemMatchConditions = this.#processFieldOperators(
+            operand,
+            `${alias}.value`,
             null as any,
           );
         } else {
@@ -790,6 +819,7 @@ export class MongoToPG {
           elemMatchConditions = this.#processQueryObject(operand, alias, ""); // Changed jsonField to alias, parentPath to ''
         }
 
+        if (elemMatchConditions === "FALSE") return "FALSE";
         if (!elemMatchConditions || elemMatchConditions === "TRUE") {
           // If conditions are empty or TRUE, just check if it's a non-empty array
           return `(${jsonPath} IS NOT NULL AND jsonb_typeof(${jsonPath}) = 'array' AND jsonb_array_length(${jsonPath}) > 0)`;
@@ -807,11 +837,9 @@ export class MongoToPG {
           object: "object",
           null: "null",
         };
-        const pgType = typeMapping[operand as string];
-        if (!pgType) {
-          console.warn(`Unsupported $type operand: ${operand}`);
-          return "FALSE";
-        }
+        if (!Object.hasOwn(typeMapping, operand))
+          throw new QueryError(`unsupported $type: ${operand}`);
+        const pgType = typeMapping[operand];
         return `jsonb_typeof(${jsonPath}) = ${bind(pgType)}`;
       }
 
@@ -839,79 +867,53 @@ export class MongoToPG {
   ): string {
     switch (operator) {
       case "$and":
-      case "$or": {
+      case "$or":
+      case "$nor": {
         if (!Array.isArray(operands))
           throw new QueryError(`${operator} requires an array`);
-        if (operands.length === 0) {
-          return operator === "$and" ? "TRUE" : "FALSE";
-        }
-        const clauses = operands
-          .map((subQuery: Record<string, any>) =>
-            this.#processQueryObject(subQuery, jsonField, parentPath),
+        if (operands.length === 0)
+          throw new QueryError(`${operator} requires a non-empty array`);
+        // every member folds to a clause, TRUE (no condition), or FALSE
+        const clauses = operands.map((subQuery) => {
+          if (
+            typeof subQuery !== "object" ||
+            subQuery === null ||
+            Array.isArray(subQuery)
           )
-          .filter((c) => c && c !== "TRUE");
-
-        if (clauses.length === 0) return operator === "$and" ? "TRUE" : "FALSE";
-        if (clauses.length === 1) {
-          return clauses[0];
-        }
-
-        const joiner = operator === "$and" ? " AND " : " OR ";
-        const joined = clauses.join(joiner);
-        return `(${joined})`;
+            throw new QueryError(`${operator} members must be objects`);
+          return (
+            this.#processQueryObject(subQuery, jsonField, parentPath) || "TRUE"
+          );
+        });
+        const join = (decides: string, neutral: string, joiner: string) => {
+          if (clauses.includes(decides)) return decides;
+          const rest = clauses.filter((c) => c !== neutral);
+          if (rest.length === 0) return neutral;
+          return rest.length === 1 ? rest[0] : `(${rest.join(joiner)})`;
+        };
+        if (operator === "$and") return join("FALSE", "TRUE", " AND ");
+        const anyOf = join("TRUE", "FALSE", " OR ");
+        if (operator === "$or") return anyOf;
+        if (anyOf === "TRUE") return "FALSE";
+        if (anyOf === "FALSE") return "TRUE";
+        return `NOT (${anyOf})`;
       }
       case "$not": {
         if (
           typeof operands !== "object" ||
           operands === null ||
           Array.isArray(operands)
-        ) {
-          console.warn(
-            `Invalid operand for $not: expected an expression object`,
-          );
-          return "FALSE";
-        }
-        let innerCondition = "";
-        const keys = Object.keys(operands);
-        if (
-          keys.length > 0 &&
-          keys.every((k) => k.startsWith("$")) &&
-          !this.#isLogicalOperator(keys[0])
-        ) {
-          innerCondition = this.#processFieldOperators(
-            operands,
-            "dummy_access",
-            "dummy_json",
-          );
-        } else {
-          innerCondition = this.#processQueryObject(
-            operands as Record<string, any>,
-            jsonField,
-            parentPath,
-          );
-        }
+        )
+          throw new QueryError("$not requires an object");
+        const innerCondition = this.#processQueryObject(
+          operands as Record<string, any>,
+          jsonField,
+          parentPath,
+        );
 
         if (!innerCondition || innerCondition === "TRUE") return "FALSE";
         if (innerCondition === "FALSE") return "TRUE";
         return `NOT (${innerCondition})`;
-      }
-      case "$nor": {
-        if (!Array.isArray(operands))
-          throw new QueryError("$nor requires an array");
-        if (operands.length === 0) {
-          return "TRUE";
-        }
-        const clauses = operands
-          .map((subQuery: Record<string, any>) =>
-            this.#processQueryObject(subQuery, jsonField, parentPath),
-          )
-          .filter((c) => c && c !== "TRUE");
-
-        if (clauses.length === 0) return "FALSE";
-
-        const joinedOr =
-          clauses.length === 1 ? clauses[0] : `(${clauses.join(" OR ")})`;
-        return `NOT (${joinedOr})`;
       }
       default:
         return "";
@@ -926,11 +928,10 @@ export class MongoToPG {
     if (
       typeof operand !== "object" ||
       operand === null ||
-      Array.isArray(operand)
-    ) {
-      console.warn(`Invalid operand for field-level $not: expected an object.`);
-      return "FALSE";
-    }
+      Array.isArray(operand) ||
+      Object.keys(operand).length === 0
+    )
+      throw new QueryError("$not requires a non-empty object");
     // Pass jsonPath down for potential null checks within operand
     const innerCondition = this.#processFieldOperators(
       operand,

@@ -236,23 +236,73 @@ describe("MongoToPG", () => {
     expect(sql).toBe(expectedSql);
   });
 
-  test("should handle empty $and array", () => {
-    const query = { $and: [] };
-    // Empty $and returns TRUE which simplifies to no WHERE clause
-    const expectedSql = `SELECT "data" FROM "test_empty_and" WHERE TRUE`;
-    const { sql } = converter.buildSelectQueryAndParams(
-      "test_empty_and",
-      query,
-    );
-    expect(sql).toBe(expectedSql);
+  test("should reject empty logical arrays and non-object members", () => {
+    for (const query of [
+      { $and: [] },
+      { $or: [] },
+      { $nor: [] },
+      { $and: [5] },
+      { $or: [null] },
+      { $nor: [["x"]] },
+    ]) {
+      expect(() => converter.buildWhereClauseAndParams(query)).toThrow(
+        QueryError,
+      );
+    }
   });
 
-  test("should handle empty $or array", () => {
-    const query = { $or: [] };
-    // Empty $or returns FALSE
-    const expectedSql = `SELECT "data" FROM "test_empty_or" WHERE FALSE`;
-    const { sql } = converter.buildSelectQueryAndParams("test_empty_or", query);
-    expect(sql).toBe(expectedSql);
+  test("should fold constants in logical operators", () => {
+    const where = (query: Record<string, any>) =>
+      converter.buildWhereClauseAndParams(query).whereClause;
+    const all = { tags: { $nin: [] } };
+    const none = { tags: { $in: [] } };
+
+    expect(where({ $and: [{}] })).toBe("WHERE TRUE");
+    expect(where({ $and: [all, { a: 1 }] })).toBe(
+      "WHERE (data->>'a')::integer = $1",
+    );
+    expect(where({ $and: [none, { a: 1 }] })).toBe("WHERE FALSE");
+    expect(where({ $or: [{}, { a: 1 }] })).toBe("WHERE TRUE");
+    expect(where({ $or: [all, { a: 1 }] })).toBe("WHERE TRUE");
+    expect(where({ $or: [none, { a: 1 }] })).toBe(
+      "WHERE (data->>'a')::integer = $1",
+    );
+    expect(where({ $or: [none] })).toBe("WHERE FALSE");
+    expect(where({ $nor: [{}, { a: 1 }] })).toBe("WHERE FALSE");
+    expect(where({ $nor: [none] })).toBe("WHERE TRUE");
+    expect(where({ $not: { $or: [{}] } })).toBe("WHERE FALSE");
+    // a FALSE among one field's operators decides, so its negation is TRUE
+    expect(where({ $nor: [{ f: { $in: [], $gt: 1 } }] })).toBe("WHERE TRUE");
+    expect(where({ f: { $not: { $in: [], $exists: true } } })).toBe(
+      "WHERE TRUE",
+    );
+    expect(where({ f: { $not: { $elemMatch: { $in: [] } } } })).toBe(
+      "WHERE TRUE",
+    );
+  });
+
+  test("should drop the parameters of a folded sub-filter", () => {
+    const build = (query: Record<string, any>) =>
+      converter.buildWhereClauseAndParams(query);
+
+    expect(build({ a: 1, f: { $in: [] } })).toEqual({
+      whereClause: "WHERE FALSE",
+      params: [],
+    });
+    expect(build({ $or: [{ a: 1 }, {}] })).toEqual({
+      whereClause: "WHERE TRUE",
+      params: [],
+    });
+    expect(
+      build({ $or: [{ $and: [{ b: 2 }, { f: { $in: [] } }] }, { a: 1 }] }),
+    ).toEqual({
+      whereClause: "WHERE (data->>'a')::integer = $1",
+      params: [1],
+    });
+    expect(build({ $nor: [{ f: { $in: [], $gt: 1 } }], a: 1 })).toEqual({
+      whereClause: "WHERE (data->>'a')::integer = $1",
+      params: [1],
+    });
   });
 
   test("should handle $nor operator", () => {
@@ -836,6 +886,82 @@ describe("MongoToPG", () => {
     });
     expect(built?.expression).toBe(
       `jsonb_set_lax("data"::jsonb, '{"a''b"}', $1::jsonb, true)`,
+    );
+  });
+
+  test("malformed operands throw instead of compiling to a constant", () => {
+    const malformed: Record<string, any>[] = [
+      { s: { $in: "x" } },
+      { s: { $nin: "x" } },
+      { s: { $all: "x" } },
+      { s: { $mod: "x" } },
+      { s: { $mod: [2] } },
+      { s: { $size: "x" } },
+      { s: { $size: 1.5 } },
+      { s: { $type: "bogus" } },
+      { s: { $type: "toString" } },
+      { s: { $elemMatch: 5 } },
+      { s: { $elemMatch: [] } },
+      { s: { $elemMatch: { $options: "i" } } },
+      { s: { $not: 5 } },
+      { s: { $not: {} } },
+      { s: { $options: "i" } },
+      { s: { $exists: "false" } },
+      { $not: 5 },
+      { $not: { $in: [] } },
+    ];
+    // a constant FALSE would flip to match-all under negation
+    const negated = malformed
+      .filter((query) => "s" in query)
+      .flatMap((query) => [
+        { s: { $not: query.s } },
+        { $not: query },
+        { $nor: [query] },
+      ]);
+
+    for (const query of [...malformed, ...negated]) {
+      expect(() => converter.buildWhereClauseAndParams(query)).toThrow(
+        QueryError,
+      );
+    }
+  });
+
+  test("should keep the legitimate constant operands", () => {
+    const where = (query: Record<string, any>) =>
+      converter.buildWhereClauseAndParams(query).whereClause;
+
+    expect(where({ s: { $all: [] } })).toBe("WHERE FALSE");
+    expect(where({ s: { $exists: 1 } })).toBe("WHERE data->'s' IS NOT NULL");
+    expect(where({ s: { $exists: 0 } })).toBe("WHERE data->'s' IS NULL");
+    expect(where({ s: { $mod: [4.5, 0] } })).toBe(
+      "WHERE (data->>'s')::numeric % $1 = $2",
+    );
+  });
+
+  test("should apply every operator of a primitive $elemMatch", () => {
+    const { sql, params } = converter.buildSelectQueryAndParams("reports", {
+      scores: { $elemMatch: { $gt: 1, $lt: 5 } },
+    });
+    expect(sql).toBe(
+      `SELECT "data" FROM "reports" WHERE EXISTS (SELECT 1 FROM jsonb_array_elements_text(data->'scores') as elem_val WHERE (elem_val.value)::numeric > $1 AND (elem_val.value)::numeric < $2)`,
+    );
+    expect(params).toEqual([1, 5]);
+  });
+
+  test("limit and offset must be non-negative integers", () => {
+    const build = (options: Record<string, any>) =>
+      converter.buildSelectQueryAndParams("t", {}, options).sql;
+
+    for (const bad of [1.5, -1, Infinity, NaN, "5", "0x10", [5], true]) {
+      expect(() => build({ limit: bad })).toThrow("limit must be");
+      expect(() => build({ offset: bad })).toThrow("offset must be");
+    }
+    expect(build({ limit: 0, offset: 0 })).toBe(`SELECT "data" FROM "t"`);
+    expect(build({ limit: null, offset: undefined })).toBe(
+      `SELECT "data" FROM "t"`,
+    );
+    expect(build({ limit: 5, offset: 10 })).toBe(
+      `SELECT "data" FROM "t" LIMIT 5 OFFSET 10`,
     );
   });
 });
