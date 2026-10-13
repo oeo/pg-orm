@@ -1,9 +1,41 @@
-import { isDeepStrictEqual } from 'util'; // Use built-in util for deep comparison
-import type { SortDirection } from './types'; // Import SortDirection type if it's not already imported (assuming it's in ./types)
+import type { AggregateOptions, LockMode, SortDirection } from "./types";
+
+const LOCK_CLAUSES: Record<LockMode, string> = {
+  update: "FOR UPDATE",
+  nowait: "FOR UPDATE NOWAIT",
+  skipLocked: "FOR UPDATE SKIP LOCKED",
+};
+
+/**
+ * A filter or update the converter does not understand. It fails closed: a
+ * dropped operator would widen an update or delete to every row. Carries
+ * status 400 so an HTTP layer can answer a bad client filter as a bad request.
+ */
+export class QueryError extends Error {
+  readonly status = 400;
+  constructor(message: string) {
+    super(message);
+    this.name = "QueryError";
+  }
+}
+
+export function lockClause(lock: LockMode): string {
+  const clause = LOCK_CLAUSES[lock];
+  if (!clause) throw new Error(`unknown lock mode: ${lock}`);
+  return clause;
+}
 
 export class MongoToPG {
   // Internal state for parameters during a single conversion
   #params: any[] = [];
+  // fields `$text` searches (SchemaOptions.textFields)
+  #textFields?: string[];
+  // placeholder of the last `$text` search, reused by a `$textScore` sort
+  #textQuery?: string;
+
+  constructor(options: { textFields?: string[] } = {}) {
+    this.#textFields = options.textFields;
+  }
 
   // Helper to add a parameter and return its placeholder
   #addParam(value: any): string {
@@ -13,6 +45,8 @@ export class MongoToPG {
 
   /**
    * Converts MongoDB query object to parameterized SQL query parts for SELECT.
+   * `columns` replaces the selected column list (default: the json column);
+   * `lock` appends a row-locking clause after LIMIT/OFFSET.
    * @returns Object containing { sql: string, params: any[] }
    */
   buildSelectQueryAndParams(
@@ -24,48 +58,145 @@ export class MongoToPG {
       limit?: number;
       offset?: number; // Added offset support
       sort?: Record<string, SortDirection>; // Use SortDirection type
-    } = {}
+      columns?: string;
+      lock?: LockMode;
+      select?: string[];
+    } = {},
   ): { sql: string; params: any[] } {
     this.#params = []; // Reset parameters for this conversion
+    this.#textQuery = undefined;
     const {
-      jsonField = 'data',
+      jsonField = "data",
       schema: schemaOption,
       limit,
       offset, // Use offset
-      sort
+      sort,
     } = options;
 
-    const tableRef = options.schema ? `${this.#quoteIdent(options.schema)}.${this.#quoteIdent(collection)}` : this.#quoteIdent(collection);
+    const tableRef = options.schema
+      ? `${this.#quoteIdent(options.schema)}.${this.#quoteIdent(collection)}`
+      : this.#quoteIdent(collection);
     const whereClause = this.#buildWhereClause(query, jsonField);
 
-    let sqlQuery = `SELECT ${this.#quoteIdent(jsonField)} FROM ${tableRef}`;
-    
+    const columns = options.select
+      ? this.#projection(options.select, jsonField)
+      : (options.columns ?? this.#quoteIdent(jsonField));
+    let sqlQuery = `SELECT ${columns} FROM ${tableRef}`;
+
     // Fix 1: Be absolutely explicit about checking for 'TRUE' string
-    if (whereClause === 'TRUE') {
-      sqlQuery += ` WHERE TRUE`; 
-    } else if (whereClause) { // Check if not empty string
+    if (whereClause === "TRUE") {
+      sqlQuery += ` WHERE TRUE`;
+    } else if (whereClause) {
+      // Check if not empty string
       sqlQuery += ` WHERE ${whereClause}`;
     }
 
-    if (sort && Object.keys(sort).length > 0) sqlQuery += this.#buildSortClause(sort, jsonField);
+    if (sort && Object.keys(sort).length > 0)
+      sqlQuery += this.#buildSortClause(sort, jsonField);
     if (limit !== undefined && limit > 0) sqlQuery += ` LIMIT ${limit}`;
     if (offset !== undefined && offset > 0) sqlQuery += ` OFFSET ${offset}`; // Handle offset
+    if (options.lock) sqlQuery += ` ${lockClause(options.lock)}`;
 
     return { sql: sqlQuery.trim(), params: this.#params };
   }
 
   /**
    * Builds only the WHERE clause and parameters from a MongoDB query object.
+   * Placeholders continue after `params`, which are returned first, so
+   * several filters can share one statement without renumbering.
    * @returns Object containing { whereClause: string (e.g., "WHERE ..."), params: any[] }
    */
   buildWhereClauseAndParams(
     query: Record<string, any>,
-    jsonField: string = 'data'
-  ): { whereClause: string, params: any[] } {
-      this.#params = []; // Reset parameters
-      const whereClause = this.#buildWhereClause(query, jsonField);
-      // Return clause with "WHERE" prefix if not empty
-      return { whereClause: whereClause ? `WHERE ${whereClause}` : '', params: this.#params };
+    jsonField: string = "data",
+    params: any[] = [],
+  ): { whereClause: string; params: any[] } {
+    this.#params = [...params];
+    this.#textQuery = undefined;
+    const whereClause = this.#buildWhereClause(query, jsonField);
+    // Return clause with "WHERE" prefix if not empty
+    return {
+      whereClause: whereClause ? `WHERE ${whereClause}` : "",
+      params: this.#params,
+    };
+  }
+
+  /**
+   * Builds one grouped SELECT for aggregate(). Group keys and filters go
+   * through the same converter as find(), and every value is a parameter.
+   * Output names are quoted identifiers; sort names must be outputs.
+   */
+  buildAggregateQueryAndParams(
+    collection: string,
+    query: Record<string, any>,
+    options: AggregateOptions,
+    jsonField: string = "data",
+  ): { sql: string; params: any[] } {
+    const column = this.#quoteIdent(jsonField);
+    const text = (path: string) =>
+      `${column} #>> ${this.#buildJsonbPath(path)}`;
+    const numeric = (path: string) => `(${text(path)})::numeric`;
+
+    const by = Object.entries(options.by ?? {});
+    const fields = Object.entries(options.fields);
+    if (!fields.length)
+      throw new QueryError("aggregate requires at least one field");
+
+    let params: any[] = [];
+    const columns: string[] = [];
+    for (const [name, key] of by) {
+      const expression =
+        typeof key === "string"
+          ? text(key)
+          : `to_timestamp(${numeric(key.$day)} / 1000)::date::text`;
+      columns.push(`${expression} AS ${this.#quoteIdent(name)}`);
+    }
+    for (const [name, spec] of fields) {
+      const { where, ...op } = spec as Record<string, any>;
+      let expression: string;
+      if ("$count" in op) expression = "COUNT(*)";
+      else if ("$countDistinct" in op)
+        expression = `COUNT(DISTINCT ${text(op.$countDistinct)})`;
+      else if ("$sum" in op) expression = `SUM(${numeric(op.$sum)})`;
+      else if ("$min" in op) expression = `MIN(${numeric(op.$min)})`;
+      else if ("$max" in op) expression = `MAX(${numeric(op.$max)})`;
+      // stored size of the whole document, as octet_length(jsonb::text)
+      else if ("$bytes" in op)
+        expression = `SUM(octet_length(${column}::text))`;
+      else throw new QueryError(`aggregate field ${name} has no operator`);
+      if (where && Object.keys(where).length) {
+        const built = this.buildWhereClauseAndParams(where, jsonField, params);
+        params = built.params;
+        if (built.whereClause) expression += ` FILTER (${built.whereClause})`;
+      }
+      // SUM over no rows is NULL; report 0 like COUNT does
+      if ("$sum" in op || "$bytes" in op)
+        expression = `COALESCE(${expression}, 0)`;
+      columns.push(`${expression} AS ${this.#quoteIdent(name)}`);
+    }
+
+    const built = this.buildWhereClauseAndParams(query, jsonField, params);
+    let sql = `SELECT ${columns.join(", ")} FROM ${this.#quoteIdent(collection)} ${built.whereClause}`;
+    if (by.length)
+      sql += ` GROUP BY ${by.map((_, index) => index + 1).join(", ")}`;
+
+    const outputs = new Set([...by, ...fields].map(([name]) => name));
+    const sort = Object.entries(options.sort ?? {});
+    if (sort.length) {
+      sql += ` ORDER BY ${sort
+        .map(([name, direction]) => {
+          if (!outputs.has(name))
+            throw new QueryError(`aggregate sort ${name} is not an output`);
+          return `${this.#quoteIdent(name)} ${direction === 1 ? "ASC" : "DESC"} NULLS LAST`;
+        })
+        .join(", ")}`;
+    }
+    if (options.limit !== undefined) {
+      if (!Number.isSafeInteger(options.limit) || options.limit < 1)
+        throw new QueryError("aggregate limit must be a positive integer");
+      sql += ` LIMIT ${options.limit}`;
+    }
+    return { sql: sql.trim(), params: built.params };
   }
 
   /**
@@ -73,205 +204,294 @@ export class MongoToPG {
    * @returns Object containing { expression: string, params: any[] } or null.
    */
   buildUpdateSetExpressionAndParams(
-      updateOps: Record<string, any>,
-      jsonField: string = 'data'
-  ): { expression: string, params: any[] } | null {
-    this.#params = []; 
+    updateOps: Record<string, any>,
+    jsonField: string = "data",
+  ): { expression: string; params: any[] } | null {
+    this.#params = [];
     let currentExpression = this.#quoteIdent(jsonField);
     let appliedOps = 0;
     for (const [operator, ops] of Object.entries(updateOps)) {
-      if (operator === '$set') {
-        if (typeof ops !== 'object' || ops === null) continue;
+      if (operator === "$set") {
+        if (typeof ops !== "object" || ops === null) continue;
         for (const [fieldPath, value] of Object.entries(ops)) {
           const pathArray = this.#buildJsonbPath(fieldPath);
           const stringifiedValue = JSON.stringify(value);
-          const valuePlaceholder = this.#addParam(stringifiedValue); 
+          const valuePlaceholder = this.#addParam(stringifiedValue);
           const jsonbExpression = `${valuePlaceholder}::jsonb`;
-          // Use jsonb_set_lax to create intermediate objects/arrays if they don't exist
+          // jsonb_set_lax creates only the last path segment: a nested path
+          // whose parent object is missing leaves the document unchanged
           currentExpression = `jsonb_set_lax(${currentExpression}::jsonb, ${pathArray}, ${jsonbExpression}, true)`;
           appliedOps++;
         }
-      } else if (operator === '$inc') {
-         if (typeof ops !== 'object' || ops === null) continue;
-         for (const [fieldPath, increment] of Object.entries(ops)) {
-           if (typeof increment !== 'number') {
-             console.warn(`Unsupported $inc value for path ${fieldPath}. Must be a number.`);
-             continue;
-           }
-           const pathArray = this.#buildJsonbPath(fieldPath);
-           const parts = fieldPath.split('.');
-           let currentAccessPath = this.#quoteIdent(jsonField);
-           for (let i = 0; i < parts.length; i++) {
-             const part = parts[i];
-             const quotedPart = this.#quoteLiteral(part);
-             currentAccessPath += `->${quotedPart}`;
-           }
-           const incrementPlaceholder = this.#addParam(increment);
-           const incrementExpression = `to_jsonb(COALESCE((${currentAccessPath})::numeric, 0) + ${incrementPlaceholder}::numeric)`;
-           // Use jsonb_set_lax here too for consistency and potential nested increments
-           currentExpression = `jsonb_set_lax(${currentExpression}::jsonb, ${pathArray}, ${incrementExpression}, true)`;
-           appliedOps++;
-         }
+      } else if (operator === "$inc") {
+        if (typeof ops !== "object" || ops === null) continue;
+        for (const [fieldPath, increment] of Object.entries(ops)) {
+          if (typeof increment !== "number")
+            throw new QueryError(`$inc ${fieldPath} must be a number`);
+          const pathArray = this.#buildJsonbPath(fieldPath);
+          const parts = fieldPath.split(".");
+          let currentAccessPath = this.#quoteIdent(jsonField);
+          for (let i = 0; i < parts.length; i++) {
+            const part = parts[i];
+            const quotedPart = this.#quoteLiteral(part);
+            currentAccessPath += `->${quotedPart}`;
+          }
+          const incrementPlaceholder = this.#addParam(increment);
+          const incrementExpression = `to_jsonb(COALESCE((${currentAccessPath})::numeric, 0) + ${incrementPlaceholder}::numeric)`;
+          // Use jsonb_set_lax here too for consistency and potential nested increments
+          currentExpression = `jsonb_set_lax(${currentExpression}::jsonb, ${pathArray}, ${incrementExpression}, true)`;
+          appliedOps++;
+        }
+      } else if (operator === "$min") {
+        // keep the smaller number: set when the stored value is missing,
+        // null, or larger. LEAST ignores NULL, so a missing value takes the
+        // operand. Numbers only; a stored non-number fails the cast.
+        if (typeof ops !== "object" || ops === null) continue;
+        for (const [fieldPath, value] of Object.entries(ops)) {
+          if (typeof value !== "number")
+            throw new QueryError(`$min ${fieldPath} must be a number`);
+          const pathArray = this.#buildJsonbPath(fieldPath);
+          const placeholder = this.#addParam(value);
+          const stored = `(${this.#quoteIdent(jsonField)} #>> ${pathArray})::numeric`;
+          currentExpression = `jsonb_set_lax(${currentExpression}::jsonb, ${pathArray}, to_jsonb(LEAST(${stored}, ${placeholder}::numeric)), true)`;
+          appliedOps++;
+        }
+      } else if (operator === "$setIfNull") {
+        // set only when the stored value is missing or JSON null
+        if (typeof ops !== "object" || ops === null) continue;
+        for (const [fieldPath, value] of Object.entries(ops)) {
+          const pathArray = this.#buildJsonbPath(fieldPath);
+          const placeholder = this.#addParam(JSON.stringify(value));
+          const stored = `${this.#quoteIdent(jsonField)} #> ${pathArray}`;
+          currentExpression = `jsonb_set_lax(${currentExpression}::jsonb, ${pathArray}, COALESCE(NULLIF(${stored}, 'null'::jsonb), ${placeholder}::jsonb), true)`;
+          appliedOps++;
+        }
       } else {
-        console.warn(`Unsupported update operator: ${operator}`);
+        throw new QueryError(`unsupported update operator: ${operator}`);
       }
     }
-    return appliedOps > 0 ? { expression: currentExpression, params: this.#params } : null;
+    return appliedOps > 0
+      ? { expression: currentExpression, params: this.#params }
+      : null;
   }
 
   /**
    * builds the condition string for the where clause
    */
   #buildWhereClause(query: Record<string, any>, jsonField: string): string {
-    if (!query || Object.keys(query).length === 0) return '';
+    if (!query || Object.keys(query).length === 0) return "";
     return this.#processQueryObject(query, jsonField);
   }
 
-  #processQueryObject(query: Record<string, any>, jsonField: string, parentPath = ''): string {
+  #processQueryObject(
+    query: Record<string, any>,
+    jsonField: string,
+    parentPath = "",
+  ): string {
     const clauses: string[] = [];
-    let isTrueResult = false; 
+    let isTrueResult = false;
 
     for (const [key, value] of Object.entries(query)) {
-      if (key === '$where') {
-        console.error('CRITICAL: Unsupported and potentially dangerous operator: $where. Query conversion aborted.');
-        throw new Error('$where operator is not supported due to security risks.');
-      }
-      if (key === '$text') {
-        console.warn('Unsupported operator: $text (requires FTS configuration). Returning TRUE.');
-        isTrueResult = true;
+      if (key === "$where") throw new QueryError("$where is not supported");
+      if (key === "$text") {
+        // { $text: { $search: "words" } } -> websearch_to_tsquery match over
+        // SchemaOptions.textFields. Without textFields it throws rather than
+        // matching every row.
+        if (!this.#textFields?.length)
+          throw new QueryError("$text requires SchemaOptions.textFields");
+        if (typeof value?.$search !== "string")
+          throw new QueryError("$text requires { $search: string }");
+        this.#textQuery = `websearch_to_tsquery('english', ${this.#addParam(value.$search)})`;
+        clauses.push(`${this.#textVector(jsonField)} @@ ${this.#textQuery}`);
         continue;
       }
-      
+
       if (this.#isLogicalOperator(key)) {
         const currentJsonFieldContext = parentPath || jsonField;
-        const logicalClause = this.#handleLogicalOperator(key, value, currentJsonFieldContext, parentPath);
+        const logicalClause = this.#handleLogicalOperator(
+          key,
+          value,
+          currentJsonFieldContext,
+          parentPath,
+        );
         if (logicalClause) {
-             // Handle TRUE/FALSE returns from logical operators
-             if (logicalClause === 'TRUE') { 
-                 isTrueResult = true; 
-                 // Don't add 'TRUE' to clauses array, just note it
-                 continue; 
-             } else if (logicalClause === 'FALSE') {
-                 return 'FALSE'; // Short-circuit
-             }
-             clauses.push(logicalClause);
+          // Handle TRUE/FALSE returns from logical operators
+          if (logicalClause === "TRUE") {
+            isTrueResult = true;
+            // Don't add 'TRUE' to clauses array, just note it
+            continue;
+          } else if (logicalClause === "FALSE") {
+            return "FALSE"; // Short-circuit
+          }
+          clauses.push(logicalClause);
         } // else: operator returned '' (empty string), ignore
         continue;
       }
-      
-      if (!key.startsWith('$')) {
-        let fieldClause = '';
-        let valueObjectForWrappingCheck: any = null; 
+
+      if (!key.startsWith("$")) {
+        let fieldClause = "";
+        let valueObjectForWrappingCheck: any = null;
         // Track if a comparison operator explicitly returned 'TRUE' (like $nin:[])
         let comparisonReturnedTrue = false;
 
-        if (key.includes('.')) {
-          const parts = key.split('.');
+        if (key.includes(".")) {
+          const parts = key.split(".");
           let currentJsonPath = parentPath ? parentPath : jsonField;
-          let currentAccessPath = '';
-          for(let i = 0; i < parts.length; i++) {
-              const part = parts[i];
-              const isLastPart = i === parts.length - 1;
-              const isNumericIndex = /^\d+$/.test(part);
-              if (isNumericIndex) { currentJsonPath += `->${part}`; }
-              else { currentJsonPath += `->\'${part}\'`; }
-              if (isLastPart) {
-                  const basePathMatch = currentJsonPath.match(/^(.*)(->\'[^\']+\'|->\d+)$/);
-                  const basePath = basePathMatch ? basePathMatch[1] : (parentPath || jsonField);
-                  if (isNumericIndex) { currentAccessPath = `${basePath}->>${part}`; }
-                  else { currentAccessPath = `${basePath}->>\'${part}\'`; }
+          let currentAccessPath = "";
+          for (let i = 0; i < parts.length; i++) {
+            const part = parts[i];
+            const isLastPart = i === parts.length - 1;
+            const isNumericIndex = /^\d+$/.test(part);
+            const basePath = currentJsonPath;
+            if (isNumericIndex) {
+              currentJsonPath += `->${part}`;
+            } else {
+              currentJsonPath += `->'${this.#escapeKey(part)}'`;
+            }
+            if (isLastPart) {
+              if (isNumericIndex) {
+                currentAccessPath = `${basePath}->>${part}`;
+              } else {
+                currentAccessPath = `${basePath}->>'${this.#escapeKey(part)}'`;
               }
+            }
           }
           if (this.#isOperatorObject(value)) {
-            fieldClause = this.#processFieldOperators(value, currentAccessPath, currentJsonPath);
+            fieldClause = this.#processFieldOperators(
+              value,
+              currentAccessPath,
+              currentJsonPath,
+            );
             valueObjectForWrappingCheck = value;
             // Check if the processFieldOperators resulted in TRUE (e.g. from $nin:[])
-            if (fieldClause === 'TRUE') comparisonReturnedTrue = true;
+            if (fieldClause === "TRUE") comparisonReturnedTrue = true;
           } else {
-            fieldClause = this.#createEqualityCondition(currentAccessPath, currentJsonPath, value);
+            fieldClause = this.#createEqualityCondition(
+              currentAccessPath,
+              currentJsonPath,
+              value,
+            );
           }
         } else {
-          const currentJsonPath = parentPath ? `${parentPath}->'${key}'` : `${jsonField}->'${key}'`;
-          const currentAccessPath = parentPath ? `${parentPath}->>'${key}'` : `${jsonField}->>'${key}'`;
-          
+          const ek = this.#escapeKey(key);
+          const currentJsonPath = parentPath
+            ? `${parentPath}->'${ek}'`
+            : `${jsonField}->'${ek}'`;
+          const currentAccessPath = parentPath
+            ? `${parentPath}->>'${ek}'`
+            : `${jsonField}->>'${ek}'`;
+
           if (this.#isOperatorObject(value)) {
-            fieldClause = this.#processFieldOperators(value, currentAccessPath, currentJsonPath);
+            fieldClause = this.#processFieldOperators(
+              value,
+              currentAccessPath,
+              currentJsonPath,
+            );
             valueObjectForWrappingCheck = value;
             // Check if the processFieldOperators resulted in TRUE (e.g. from $nin:[])
-            if (fieldClause === 'TRUE') comparisonReturnedTrue = true;
+            if (fieldClause === "TRUE") comparisonReturnedTrue = true;
           } else {
-            fieldClause = this.#createEqualityCondition(currentAccessPath, currentJsonPath, value);
+            fieldClause = this.#createEqualityCondition(
+              currentAccessPath,
+              currentJsonPath,
+              value,
+            );
           }
         }
 
-        if (fieldClause && fieldClause !== 'TRUE') {
-           if (valueObjectForWrappingCheck) {
-               const operatorKeys = Object.keys(valueObjectForWrappingCheck).filter(k => k !== '$options');
-               if (operatorKeys.length > 1) {
-                   fieldClause = `(${fieldClause})`;
-               }
-           }
-           clauses.push(fieldClause);
+        if (fieldClause && fieldClause !== "TRUE") {
+          if (valueObjectForWrappingCheck) {
+            const operatorKeys = Object.keys(
+              valueObjectForWrappingCheck,
+            ).filter((k) => k !== "$options");
+            if (operatorKeys.length > 1) {
+              fieldClause = `(${fieldClause})`;
+            }
+          }
+          clauses.push(fieldClause);
         }
         // If the comparison operator returned 'TRUE', mark the overall result as potentially TRUE
         if (comparisonReturnedTrue) {
-            isTrueResult = true; 
+          isTrueResult = true;
         }
       } else {
-        console.warn(`Unsupported operator used as field: ${key}`);
+        throw new QueryError(`unsupported operator: ${key}`);
       }
     }
 
-    if (clauses.includes('FALSE')) return 'FALSE'; 
+    if (clauses.includes("FALSE")) return "FALSE";
     // Filter out TRUE clauses before joining, but respect isTrueResult
-    const validClauses = clauses.filter(c => c && c !== 'TRUE'); 
+    const validClauses = clauses.filter((c) => c && c !== "TRUE");
 
     if (validClauses.length === 0) {
-      // Return TRUE if isTrueResult was set (e.g. $text, or $nin:[]) 
+      // Return TRUE if isTrueResult was set (e.g. $nin:[])
       // OR if a logical operator returned TRUE (handled within logical operator logic)
-      return isTrueResult ? 'TRUE' : ''; 
+      return isTrueResult ? "TRUE" : "";
     }
-    
-    const joined = validClauses.join(' AND ');
-    return joined; 
+
+    const joined = validClauses.join(" AND ");
+    return joined;
   }
 
-  #processFieldOperators(operators: Record<string, any>, accessPath: string, jsonPath: string): string {
+  #processFieldOperators(
+    operators: Record<string, any>,
+    accessPath: string,
+    jsonPath: string,
+  ): string {
     const fieldClauses: string[] = [];
     let operatorReturnedTrue = false; // Track if any operator returns TRUE
 
     for (const [op, operand] of Object.entries(operators)) {
-       if (op === '$not') {
-           // Pass jsonPath correctly for null checks inside $not operand handling
-           const notCondition = this.#handleNotOperator(operand, accessPath, jsonPath); 
-           if (notCondition) fieldClauses.push(notCondition);
-           continue;
-       }
-      const clause = this.#handleComparisonOperator(op, operand, accessPath, jsonPath, operators.$options as string | undefined);
-      // Check if the operator returned TRUE
-      if (clause === 'TRUE') {
-          operatorReturnedTrue = true;
-          // Don't add 'TRUE' to clauses, just note it.
-          continue; 
+      if (op === "$not") {
+        // Pass jsonPath correctly for null checks inside $not operand handling
+        const notCondition = this.#handleNotOperator(
+          operand,
+          accessPath,
+          jsonPath,
+        );
+        if (notCondition) fieldClauses.push(notCondition);
+        continue;
       }
-      if (clause) { // Add non-empty, non-TRUE clauses
+      const clause = this.#handleComparisonOperator(
+        op,
+        operand,
+        accessPath,
+        jsonPath,
+        operators.$options as string | undefined,
+      );
+      // Check if the operator returned TRUE
+      if (clause === "TRUE") {
+        operatorReturnedTrue = true;
+        // Don't add 'TRUE' to clauses, just note it.
+        continue;
+      }
+      if (clause) {
+        // Add non-empty, non-TRUE clauses
         fieldClauses.push(clause);
       }
     }
     // If any operator returned TRUE and there are no other clauses, return TRUE
     if (operatorReturnedTrue && fieldClauses.length === 0) {
-        return 'TRUE';
+      return "TRUE";
     }
     // If there are clauses, join them; otherwise return empty or FALSE if applicable (though FALSE handled implicitly)
-    return fieldClauses.join(' AND ');
+    return fieldClauses.join(" AND ");
   }
 
-  #createEqualityCondition(accessPath: string, jsonPath: string, value: any): string {
+  #createEqualityCondition(
+    accessPath: string,
+    jsonPath: string,
+    value: any,
+  ): string {
     if (value === null) {
-       // Fix: Use jsonPath directly for null checks
-       return `(${jsonPath} IS NULL OR ${jsonPath} = 'null'::jsonb)`;
+      // Fix: Use jsonPath directly for null checks
+      return `(${jsonPath} IS NULL OR ${jsonPath} = 'null'::jsonb)`;
     }
-    if (typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === 0) {
+    if (
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      Object.keys(value).length === 0
+    ) {
       return `${jsonPath}::jsonb = '{}'::jsonb`;
     }
 
@@ -280,256 +500,334 @@ export class MongoToPG {
     if (Array.isArray(value)) {
       return `${jsonPath}::jsonb = ${valuePlaceholder}::jsonb`;
     }
-    if (typeof value === 'boolean') {
-        return `(${accessPath})::boolean = ${valuePlaceholder}`;
+    if (typeof value === "boolean") {
+      return `(${accessPath})::boolean = ${valuePlaceholder}`;
     }
-    if (typeof value === 'number') {
-        const cast = Number.isInteger(value) ? 'integer' : 'numeric';
-        return `(${accessPath})::${cast} = ${valuePlaceholder}`;
+    if (typeof value === "number") {
+      const cast = Number.isInteger(value) ? "integer" : "numeric";
+      return `(${accessPath})::${cast} = ${valuePlaceholder}`;
     }
     return `${accessPath} = ${valuePlaceholder}`;
   }
 
   #handleComparisonOperator(
-    operator: string, 
-    operand: any, 
+    operator: string,
+    operand: any,
     accessPath: string,
     jsonPath: string, // Ensure jsonPath is consistently available
-    regexOptions?: string
+    regexOptions?: string,
   ): string {
-    const sqlVal = (val: any) => this.#sqlValue(val);
+    const bind = (val: any) => this.#bindValue(val);
     const numericAccessPath = `(${accessPath})::numeric`;
     const booleanAccessPath = `(${accessPath})::boolean`;
 
-    switch(operator) {
-      case '$eq':
+    switch (operator) {
+      case "$eq":
         if (operand === undefined) return `${jsonPath} IS NULL`; // Use jsonPath
         return this.#createEqualityCondition(accessPath, jsonPath, operand); // Passes jsonPath
-        
-      case '$ne':
+
+      case "$ne": {
         if (operand === undefined) return `${jsonPath} IS NOT NULL`; // Use jsonPath
         if (operand === null) {
-           // Fix: Use jsonPath directly for null checks
-           return `(${jsonPath} IS NOT NULL AND ${jsonPath} != 'null'::jsonb)`;
+          // Fix: Use jsonPath directly for null checks
+          return `(${jsonPath} IS NOT NULL AND ${jsonPath} != 'null'::jsonb)`;
         }
-        if (typeof operand === 'object' && !Array.isArray(operand) && Object.keys(operand).length === 0) {
-           return `${jsonPath}::jsonb != '{}'::jsonb`; // Use jsonPath
+        if (
+          typeof operand === "object" &&
+          !Array.isArray(operand) &&
+          Object.keys(operand).length === 0
+        ) {
+          return `${jsonPath}::jsonb != '{}'::jsonb`; // Use jsonPath
         }
-        
+
         const neValuePlaceholder = this.#addParam(operand);
 
-        if (typeof operand === 'boolean') {
-            return `(${accessPath})::boolean IS DISTINCT FROM ${neValuePlaceholder}`;
+        if (typeof operand === "boolean") {
+          return `(${accessPath})::boolean IS DISTINCT FROM ${neValuePlaceholder}`;
         }
         if (Array.isArray(operand)) {
-            return `${jsonPath}::jsonb != ${neValuePlaceholder}::jsonb`; // Use jsonPath
+          return `${jsonPath}::jsonb != ${neValuePlaceholder}::jsonb`; // Use jsonPath
         }
-         if (typeof operand === 'number') {
-             const cast = Number.isInteger(operand) ? 'integer' : 'numeric';
-             return `(${accessPath})::${cast} IS DISTINCT FROM ${neValuePlaceholder}`;
+        if (typeof operand === "number") {
+          const cast = Number.isInteger(operand) ? "integer" : "numeric";
+          return `(${accessPath})::${cast} IS DISTINCT FROM ${neValuePlaceholder}`;
         }
         return `${accessPath} IS DISTINCT FROM ${neValuePlaceholder}`;
-        
-      case '$gt':
-        return typeof operand === 'number' ? `${numericAccessPath} > ${sqlVal(operand)}` : `${accessPath} > ${sqlVal(operand)}`;
-        
-      case '$gte':
-        return typeof operand === 'number' ? `${numericAccessPath} >= ${sqlVal(operand)}` : `${accessPath} >= ${sqlVal(operand)}`;
-        
-      case '$lt':
-        return typeof operand === 'number' ? `${numericAccessPath} < ${sqlVal(operand)}` : `${accessPath} < ${sqlVal(operand)}`;
-        
-      case '$lte':
-        return typeof operand === 'number' ? `${numericAccessPath} <= ${sqlVal(operand)}` : `${accessPath} <= ${sqlVal(operand)}`;
-        
-      case '$in': {
-        if (!Array.isArray(operand) || operand.length === 0) return 'FALSE';
+      }
+
+      case "$gt":
+        return typeof operand === "number"
+          ? `${numericAccessPath} > ${bind(operand)}`
+          : `${accessPath} > ${bind(operand)}`;
+
+      case "$gte":
+        return typeof operand === "number"
+          ? `${numericAccessPath} >= ${bind(operand)}`
+          : `${accessPath} >= ${bind(operand)}`;
+
+      case "$lt":
+        return typeof operand === "number"
+          ? `${numericAccessPath} < ${bind(operand)}`
+          : `${accessPath} < ${bind(operand)}`;
+
+      case "$lte":
+        return typeof operand === "number"
+          ? `${numericAccessPath} <= ${bind(operand)}`
+          : `${accessPath} <= ${bind(operand)}`;
+
+      case "$in": {
+        if (!Array.isArray(operand) || operand.length === 0) return "FALSE";
         const hasNull = operand.includes(null);
-        const nonNullOperands = operand.filter(v => v !== null);
+        const nonNullOperands = operand.filter((v) => v !== null);
         if (nonNullOperands.length === 0) {
-            return hasNull ? `(${jsonPath} IS NULL OR ${jsonPath} = 'null'::jsonb)` : 'FALSE'; 
+          return hasNull
+            ? `(${jsonPath} IS NULL OR ${jsonPath} = 'null'::jsonb)`
+            : "FALSE";
         }
-        
+
         // Revert Fix 3: Explicitly handle integer and number groups again
-        const groups: { integer: number[], number: number[], boolean: boolean[], string: string[], object: any[] } = { integer: [], number: [], boolean: [], string: [], object: [] };
-        nonNullOperands.forEach(val => {
-            const type = typeof val;
-            if (type === 'number') {
-                // Separate integer and float/numeric using string check for decimal
-                if (String(val).includes('.')) {
-                    groups.number.push(val); 
-                } else {
-                    groups.integer.push(val); 
-                }
-            } else if (type === 'boolean') groups.boolean.push(val);
-            else if (type === 'string') groups.string.push(val);
-            else if (type === 'object') groups.object.push(val);
+        const groups: {
+          integer: number[];
+          number: number[];
+          boolean: boolean[];
+          string: string[];
+          object: any[];
+        } = { integer: [], number: [], boolean: [], string: [], object: [] };
+        nonNullOperands.forEach((val) => {
+          const type = typeof val;
+          if (type === "number") {
+            // Separate integer and float/numeric using string check for decimal
+            if (String(val).includes(".")) {
+              groups.number.push(val);
+            } else {
+              groups.integer.push(val);
+            }
+          } else if (type === "boolean") groups.boolean.push(val);
+          else if (type === "string") groups.string.push(val);
+          else if (type === "object") groups.object.push(val);
         });
 
         const conditions: string[] = [];
         // Check and add conditions for each type group if it has elements
-        if(groups.integer.length > 0) conditions.push(`(${accessPath})::integer = ANY(${this.#addParam(groups.integer)})`);
-        if(groups.number.length > 0) conditions.push(`(${accessPath})::numeric = ANY(${this.#addParam(groups.number)})`);
-        if(groups.boolean.length > 0) conditions.push(`(${accessPath})::boolean = ANY(${this.#addParam(groups.boolean)})`);
-        if(groups.string.length > 0) conditions.push(`${accessPath} = ANY(${this.#addParam(groups.string)})`);
-        if(groups.object.length > 0) conditions.push(`${jsonPath}::jsonb = ANY(${this.#addParam(groups.object)}::jsonb[])`);
-        
-        let nonNullCondition = conditions.join(' OR ');
+        if (groups.integer.length > 0)
+          conditions.push(
+            `(${accessPath})::integer = ANY(${this.#addParam(groups.integer)})`,
+          );
+        if (groups.number.length > 0)
+          conditions.push(
+            `(${accessPath})::numeric = ANY(${this.#addParam(groups.number)})`,
+          );
+        if (groups.boolean.length > 0)
+          conditions.push(
+            `(${accessPath})::boolean = ANY(${this.#addParam(groups.boolean)})`,
+          );
+        if (groups.string.length > 0)
+          conditions.push(
+            `${accessPath} = ANY(${this.#addParam(groups.string)})`,
+          );
+        if (groups.object.length > 0)
+          conditions.push(
+            `${jsonPath}::jsonb = ANY(${this.#addParam(groups.object)}::jsonb[])`,
+          );
+
+        let nonNullCondition = conditions.join(" OR ");
         if (conditions.length > 1) {
-           nonNullCondition = `(${nonNullCondition})`; 
+          nonNullCondition = `(${nonNullCondition})`;
         }
 
         if (hasNull) {
-            const nullCheck = `(${jsonPath} IS NULL OR ${jsonPath} = 'null'::jsonb)`;
-            // Fix 2: Wrap nonNullCondition explicitly to match test expectations
-            return nonNullCondition ? `((${nonNullCondition}) OR ${nullCheck})` : nullCheck; 
+          const nullCheck = `(${jsonPath} IS NULL OR ${jsonPath} = 'null'::jsonb)`;
+          // Fix 2: Wrap nonNullCondition explicitly to match test expectations
+          return nonNullCondition
+            ? `((${nonNullCondition}) OR ${nullCheck})`
+            : nullCheck;
         }
-        
-        return nonNullCondition || 'FALSE'; 
-      }
-      
-      case '$nin': {
-         // Fix 1: Ensure $nin:[] returns 'TRUE' string
-         if (Array.isArray(operand) && operand.length === 0) {
-             return 'TRUE'; 
-         }
-         if (!Array.isArray(operand)) return 'TRUE'; 
-         const hasNull = operand.includes(null);
-         const nonNullOperands = operand.filter(v => v !== null);
-         if (nonNullOperands.length === 0) {
-             return hasNull ? `(${jsonPath} IS NOT NULL AND ${jsonPath} != 'null'::jsonb)` : 'TRUE';
-         }
-         const conditions: string[] = [];
-         const groups: { [type: string]: any[] } = {};
-         nonNullOperands.forEach(val => { groups[typeof val] = [...(groups[typeof val] || []), val]; });
-         for (const [type, values] of Object.entries(groups)) {
-            const valuePlaceholder = this.#addParam(values);
-            let condition = '';
-             if (type === 'number') {
-                 const cast = values.some(v => !Number.isInteger(v)) ? 'numeric' : 'integer';
-                 condition = `(${accessPath})::${cast} != ALL(${valuePlaceholder})`;
-             } else if (type === 'boolean') {
-                 condition = `(${accessPath})::boolean != ALL(${valuePlaceholder})`;
-             } else if (type === 'object') { 
-                condition = `${jsonPath}::jsonb <> ALL(${valuePlaceholder}::jsonb[])`; 
-             } else {
-                 condition = `${accessPath} != ALL(${valuePlaceholder})`;
-             }
-             conditions.push(condition);
-         }
-         let nonNullCondition = conditions.join(' AND '); 
-         if (conditions.length > 1) {
-             nonNullCondition = `(${nonNullCondition})`;
-         }
-         if (hasNull) {
-             const nullCheck = `${jsonPath} IS NOT NULL AND ${jsonPath} != 'null'::jsonb`;
-             return `(${nonNullCondition} AND (${nullCheck}))`;
-         }
-         return nonNullCondition;
-      }
-      
-      case '$exists':
-        return operand ? `${jsonPath} IS NOT NULL` : `${jsonPath} IS NULL`;
-        
-      case '$regex': {
-        let pattern = operand;
-        let flags = regexOptions || '';
-        
-        if (Array.isArray(operand) && operand.length === 2 && typeof operand[0] === 'string' && typeof operand[1] === 'string') {
-           pattern = operand[0];
-           flags = operand[1];
-        } else if (typeof operand === 'string' && operand.startsWith('/') && operand.lastIndexOf('/') > 0) {
-          const match = operand.match(/^\/(.+)\/([gimyus]*)$/);
-          if (match) {
-              pattern = match[1];
-              flags = match[2];
-          }
-        }
-        
-        const op = flags.includes('i') ? '~*' : '~';
-        return `${accessPath} ${op} ${sqlVal(pattern)}`;
+
+        return nonNullCondition || "FALSE";
       }
 
-      case '$mod':
-        if (Array.isArray(operand) && operand.length === 2 && typeof operand[0] === 'number' && typeof operand[1] === 'number') {
-          return `${numericAccessPath} % ${sqlVal(operand[0])} = ${sqlVal(operand[1])}`;
+      case "$nin": {
+        // Fix 1: Ensure $nin:[] returns 'TRUE' string
+        if (Array.isArray(operand) && operand.length === 0) {
+          return "TRUE";
         }
-        console.warn('Invalid $mod operand: requires [divisor, remainder]');
-        return 'FALSE';
-        
-      case '$size':
-        if (typeof operand !== 'number' || !Number.isInteger(operand) || operand < 0) {
-            console.warn('$size requires a non-negative integer');
-            return 'FALSE';
+        if (!Array.isArray(operand)) return "TRUE";
+        const hasNull = operand.includes(null);
+        const nonNullOperands = operand.filter((v) => v !== null);
+        if (nonNullOperands.length === 0) {
+          return hasNull
+            ? `(${jsonPath} IS NOT NULL AND ${jsonPath} != 'null'::jsonb)`
+            : "TRUE";
+        }
+        const conditions: string[] = [];
+        const groups: { [type: string]: any[] } = {};
+        nonNullOperands.forEach((val) => {
+          groups[typeof val] = [...(groups[typeof val] || []), val];
+        });
+        for (const [type, values] of Object.entries(groups)) {
+          const valuePlaceholder = this.#addParam(values);
+          let condition = "";
+          if (type === "number") {
+            const cast = values.some((v) => !Number.isInteger(v))
+              ? "numeric"
+              : "integer";
+            condition = `(${accessPath})::${cast} != ALL(${valuePlaceholder})`;
+          } else if (type === "boolean") {
+            condition = `(${accessPath})::boolean != ALL(${valuePlaceholder})`;
+          } else if (type === "object") {
+            condition = `${jsonPath}::jsonb <> ALL(${valuePlaceholder}::jsonb[])`;
+          } else {
+            condition = `${accessPath} != ALL(${valuePlaceholder})`;
+          }
+          conditions.push(condition);
+        }
+        let nonNullCondition = conditions.join(" AND ");
+        if (conditions.length > 1) {
+          nonNullCondition = `(${nonNullCondition})`;
+        }
+        if (hasNull) {
+          const nullCheck = `${jsonPath} IS NOT NULL AND ${jsonPath} != 'null'::jsonb`;
+          return `(${nonNullCondition} AND (${nullCheck}))`;
+        }
+        return nonNullCondition;
+      }
+
+      case "$exists":
+        return operand ? `${jsonPath} IS NOT NULL` : `${jsonPath} IS NULL`;
+
+      case "$regex": {
+        let pattern = operand;
+        let flags = regexOptions || "";
+
+        if (
+          Array.isArray(operand) &&
+          operand.length === 2 &&
+          typeof operand[0] === "string" &&
+          typeof operand[1] === "string"
+        ) {
+          pattern = operand[0];
+          flags = operand[1];
+        } else if (
+          typeof operand === "string" &&
+          operand.startsWith("/") &&
+          operand.lastIndexOf("/") > 0
+        ) {
+          const match = operand.match(/^\/(.+)\/([gimyus]*)$/);
+          if (match) {
+            pattern = match[1];
+            flags = match[2];
+          }
+        }
+
+        const op = flags.includes("i") ? "~*" : "~";
+        return `${accessPath} ${op} ${bind(pattern)}`;
+      }
+
+      case "$mod":
+        if (
+          Array.isArray(operand) &&
+          operand.length === 2 &&
+          typeof operand[0] === "number" &&
+          typeof operand[1] === "number"
+        ) {
+          return `${numericAccessPath} % ${bind(operand[0])} = ${bind(operand[1])}`;
+        }
+        console.warn("Invalid $mod operand: requires [divisor, remainder]");
+        return "FALSE";
+
+      case "$size":
+        if (
+          typeof operand !== "number" ||
+          !Number.isInteger(operand) ||
+          operand < 0
+        ) {
+          console.warn("$size requires a non-negative integer");
+          return "FALSE";
         }
         return `(jsonb_typeof(${jsonPath}) = 'array' AND jsonb_array_length(${jsonPath}) = ${operand})`;
 
-      case '$all':
+      case "$all":
         if (!Array.isArray(operand)) {
-          console.warn('$all requires an array operand');
-          return 'FALSE';
+          console.warn("$all requires an array operand");
+          return "FALSE";
         }
-        if (operand.length === 0) return 'TRUE';
-        return `${jsonPath} @> ${sqlVal(operand)}::jsonb`;
+        if (operand.length === 0) return "TRUE";
+        return `${jsonPath} @> ${bind(operand)}::jsonb`;
 
-      case '$elemMatch': { 
-        if (typeof operand !== 'object' || operand === null) {
+      case "$elemMatch": {
+        if (typeof operand !== "object" || operand === null) {
           console.warn(`Invalid $elemMatch operand: must be an object`);
-          return 'FALSE';
+          return "FALSE";
         }
-        
-        const keys = Object.keys(operand);
-        const allKeysAreOperators = keys.every(k => k.startsWith('$'));
-        const containsLogicalOperator = keys.some(k => this.#isLogicalOperator(k));
-        const isPrimitiveMatch = allKeysAreOperators && !containsLogicalOperator;
 
-        let elemMatchConditions = '';
-        let alias = 'elem'; 
-        let arrayElementsFunc = 'jsonb_array_elements'; 
-        
+        const keys = Object.keys(operand);
+        const allKeysAreOperators = keys.every((k) => k.startsWith("$"));
+        const containsLogicalOperator = keys.some((k) =>
+          this.#isLogicalOperator(k),
+        );
+        const isPrimitiveMatch =
+          allKeysAreOperators && !containsLogicalOperator;
+
+        let elemMatchConditions = "";
+        let alias = "elem";
+        let arrayElementsFunc = "jsonb_array_elements";
+
         if (isPrimitiveMatch) {
-            arrayElementsFunc = 'jsonb_array_elements_text';
-            alias = 'elem_val'; 
-            const primitiveOperator = Object.keys(operand)[0];
-            const primitiveOperand = Object.values(operand)[0];
-            const primitiveAccessPath = `${alias}.value`; 
-            // Pass null for jsonPath here as we are operating on extracted text primitive
-            elemMatchConditions = this.#handleComparisonOperator(primitiveOperator, primitiveOperand, primitiveAccessPath, null as any); 
+          arrayElementsFunc = "jsonb_array_elements_text";
+          alias = "elem_val";
+          const primitiveOperator = Object.keys(operand)[0];
+          const primitiveOperand = Object.values(operand)[0];
+          const primitiveAccessPath = `${alias}.value`;
+          // Pass null for jsonPath here as we are operating on extracted text primitive
+          elemMatchConditions = this.#handleComparisonOperator(
+            primitiveOperator,
+            primitiveOperand,
+            primitiveAccessPath,
+            null as any,
+          );
         } else {
-             // Pass alias as the jsonField context for processing nested object
-            elemMatchConditions = this.#processQueryObject(operand, alias, ''); // Changed jsonField to alias, parentPath to ''
+          // Pass alias as the jsonField context for processing nested object
+          elemMatchConditions = this.#processQueryObject(operand, alias, ""); // Changed jsonField to alias, parentPath to ''
         }
- 
-        if (!elemMatchConditions || elemMatchConditions === 'TRUE') {
-            // If conditions are empty or TRUE, just check if it's a non-empty array
-            return `(${jsonPath} IS NOT NULL AND jsonb_typeof(${jsonPath}) = 'array' AND jsonb_array_length(${jsonPath}) > 0)`;
+
+        if (!elemMatchConditions || elemMatchConditions === "TRUE") {
+          // If conditions are empty or TRUE, just check if it's a non-empty array
+          return `(${jsonPath} IS NOT NULL AND jsonb_typeof(${jsonPath}) = 'array' AND jsonb_array_length(${jsonPath}) > 0)`;
         }
-        
+
         return `EXISTS (SELECT 1 FROM ${arrayElementsFunc}(${jsonPath}) as ${alias} WHERE ${elemMatchConditions})`;
       }
 
-      case '$type': {
-          const typeMapping: Record<string, string> = {
-              string: 'string', number: 'number', boolean: 'boolean',
-              array: 'array', object: 'object', null: 'null'
-          };
-          const pgType = typeMapping[operand as string];
-          if (!pgType) {
-              console.warn(`Unsupported $type operand: ${operand}`);
-              return 'FALSE';
-          }
-          return `jsonb_typeof(${jsonPath}) = ${sqlVal(pgType)}`;
+      case "$type": {
+        const typeMapping: Record<string, string> = {
+          string: "string",
+          number: "number",
+          boolean: "boolean",
+          array: "array",
+          object: "object",
+          null: "null",
+        };
+        const pgType = typeMapping[operand as string];
+        if (!pgType) {
+          console.warn(`Unsupported $type operand: ${operand}`);
+          return "FALSE";
+        }
+        return `jsonb_typeof(${jsonPath}) = ${bind(pgType)}`;
       }
 
-      case '$search': 
-         console.warn('Unsupported operator: $search (part of $text, requires FTS configuration)');
-         // Return empty string instead of TRUE for unsupported ops
-         return ''; 
-          
+      case "$ieq":
+        // case-insensitive equality; lower(data->>'f') is also the form an
+        // expression index on lower() matches
+        if (typeof operand !== "string")
+          throw new QueryError("$ieq requires a string");
+        return `lower(${accessPath}) = lower(${this.#addParam(operand)})`;
+
+      case "$options":
+        // flags for a sibling $regex, read there
+        return "";
+
       default:
-        console.warn(`Unsupported operator: ${operator}`);
-        // Return empty string instead of TRUE for unsupported ops
-        return ''; 
+        throw new QueryError(`unsupported operator: ${operator}`);
     }
   }
 
@@ -537,175 +835,224 @@ export class MongoToPG {
     operator: string,
     operands: any,
     jsonField: string,
-    parentPath: string
+    parentPath: string,
   ): string {
     switch (operator) {
-      case '$and':
-      case '$or': {
-        if (!Array.isArray(operands)) {
-          console.warn(`Invalid operand for ${operator}: expected an array`);
-          return operator === '$and' ? 'TRUE' : 'FALSE';
-        }
+      case "$and":
+      case "$or": {
+        if (!Array.isArray(operands))
+          throw new QueryError(`${operator} requires an array`);
         if (operands.length === 0) {
-           return operator === '$and' ? 'TRUE' : 'FALSE';
+          return operator === "$and" ? "TRUE" : "FALSE";
         }
-        const clauses = operands.map((subQuery: Record<string, any>) => this.#processQueryObject(subQuery, jsonField, parentPath))
-                              .filter(c => c && c !== 'TRUE');
-        
-        if (clauses.length === 0) return operator === '$and' ? 'TRUE' : 'FALSE';
+        const clauses = operands
+          .map((subQuery: Record<string, any>) =>
+            this.#processQueryObject(subQuery, jsonField, parentPath),
+          )
+          .filter((c) => c && c !== "TRUE");
+
+        if (clauses.length === 0) return operator === "$and" ? "TRUE" : "FALSE";
         if (clauses.length === 1) {
-            return clauses[0]; 
+          return clauses[0];
         }
-        
-        const joiner = operator === '$and' ? ' AND ' : ' OR ';
+
+        const joiner = operator === "$and" ? " AND " : " OR ";
         const joined = clauses.join(joiner);
         return `(${joined})`;
       }
-      case '$not': {
-         if (typeof operands !== 'object' || operands === null || Array.isArray(operands)) {
-            console.warn(`Invalid operand for $not: expected an expression object`);
-            return 'FALSE'; 
-         }
-         let innerCondition = '';
-         const keys = Object.keys(operands);
-         if (keys.length > 0 && keys.every(k => k.startsWith('$')) && !this.#isLogicalOperator(keys[0])) {
-             innerCondition = this.#processFieldOperators(operands, 'dummy_access', 'dummy_json');
-         } else {
-             innerCondition = this.#processQueryObject(operands as Record<string, any>, jsonField, parentPath);
-         }
-         
-         if (!innerCondition || innerCondition === 'TRUE') return 'FALSE';
-         if (innerCondition === 'FALSE') return 'TRUE';
-         return `NOT (${innerCondition})`;
+      case "$not": {
+        if (
+          typeof operands !== "object" ||
+          operands === null ||
+          Array.isArray(operands)
+        ) {
+          console.warn(
+            `Invalid operand for $not: expected an expression object`,
+          );
+          return "FALSE";
+        }
+        let innerCondition = "";
+        const keys = Object.keys(operands);
+        if (
+          keys.length > 0 &&
+          keys.every((k) => k.startsWith("$")) &&
+          !this.#isLogicalOperator(keys[0])
+        ) {
+          innerCondition = this.#processFieldOperators(
+            operands,
+            "dummy_access",
+            "dummy_json",
+          );
+        } else {
+          innerCondition = this.#processQueryObject(
+            operands as Record<string, any>,
+            jsonField,
+            parentPath,
+          );
+        }
+
+        if (!innerCondition || innerCondition === "TRUE") return "FALSE";
+        if (innerCondition === "FALSE") return "TRUE";
+        return `NOT (${innerCondition})`;
       }
-      case '$nor': {
-        if (!Array.isArray(operands)) {
-          console.warn('Invalid operand for $nor: expected an array');
-          return 'TRUE';
-        }
+      case "$nor": {
+        if (!Array.isArray(operands))
+          throw new QueryError("$nor requires an array");
         if (operands.length === 0) {
-           return 'TRUE';
+          return "TRUE";
         }
-        const clauses = operands.map((subQuery: Record<string, any>) => this.#processQueryObject(subQuery, jsonField, parentPath))
-                               .filter(c => c && c !== 'TRUE');
-        
-        if (clauses.length === 0) return 'FALSE';
-        
-        const joinedOr = clauses.length === 1 ? clauses[0] : `(${clauses.join(' OR ')})`;
+        const clauses = operands
+          .map((subQuery: Record<string, any>) =>
+            this.#processQueryObject(subQuery, jsonField, parentPath),
+          )
+          .filter((c) => c && c !== "TRUE");
+
+        if (clauses.length === 0) return "FALSE";
+
+        const joinedOr =
+          clauses.length === 1 ? clauses[0] : `(${clauses.join(" OR ")})`;
         return `NOT (${joinedOr})`;
       }
       default:
-        return '';
+        return "";
     }
   }
 
-  #handleNotOperator(operand: any, accessPath: string, jsonPath: string): string {
-    if (typeof operand !== 'object' || operand === null || Array.isArray(operand)) {
-        console.warn(`Invalid operand for field-level $not: expected an object.`);
-        return 'FALSE';
+  #handleNotOperator(
+    operand: any,
+    accessPath: string,
+    jsonPath: string,
+  ): string {
+    if (
+      typeof operand !== "object" ||
+      operand === null ||
+      Array.isArray(operand)
+    ) {
+      console.warn(`Invalid operand for field-level $not: expected an object.`);
+      return "FALSE";
     }
     // Pass jsonPath down for potential null checks within operand
-    const innerCondition = this.#processFieldOperators(operand, accessPath, jsonPath);
+    const innerCondition = this.#processFieldOperators(
+      operand,
+      accessPath,
+      jsonPath,
+    );
 
-    if (!innerCondition || innerCondition === 'TRUE') {
-        return 'FALSE';
+    if (!innerCondition || innerCondition === "TRUE") {
+      return "FALSE";
     }
-    if (innerCondition === 'FALSE') {
-        return 'TRUE';
+    if (innerCondition === "FALSE") {
+      return "TRUE";
     }
     return `NOT (${innerCondition})`;
   }
 
   #isLogicalOperator(key: string): boolean {
-    return ['$and', '$or', '$nor', '$not'].includes(key);
+    return ["$and", "$or", "$nor", "$not"].includes(key);
   }
 
   #isOperatorObject(value: any): boolean {
     return (
-      typeof value === 'object' && 
-      value !== null && 
-      !Array.isArray(value) && 
-      Object.keys(value).some(key => key.startsWith('$'))
+      typeof value === "object" &&
+      value !== null &&
+      !Array.isArray(value) &&
+      Object.keys(value).some((key) => key.startsWith("$"))
     );
   }
 
-  #sqlValue(value: any): string {
-    if (value === undefined || value === null) {
-      return 'NULL';
-    }
-    if (typeof value === 'string') {
-      return `'${value.replace(/'/g, "''")}'`;
-    }
-    if (typeof value === 'number' || typeof value === 'boolean') {
-      return String(value);
-    }
-    if (Array.isArray(value)) {
-      return `'${JSON.stringify(value)}'`;
-    }
-    return `'${JSON.stringify(value)}'`;
+  // Bind an operand as a parameter. Operands can come from client-supplied
+  // filter JSON, so none may be spliced into the SQL text. Arrays and objects
+  // bind as their JSON text.
+  #bindValue(value: any): string {
+    if (value === undefined) return this.#addParam(null);
+    if (typeof value === "object" && value !== null)
+      return this.#addParam(JSON.stringify(value));
+    return this.#addParam(value);
   }
 
-  #buildSortClause(sort: Record<string, SortDirection> | undefined, jsonField: string): string {
+  #buildSortClause(
+    sort: Record<string, SortDirection> | undefined,
+    jsonField: string,
+  ): string {
     if (!sort || Object.keys(sort).length === 0) {
-      return '';
+      return "";
     }
     const sortClauses = Object.entries(sort).map(([key, direction]) => {
       // Convert 1 / -1 back to ASC / DESC
-      const pgDirection = direction === 1 ? 'ASC' : 'DESC'; 
-      
-      let accessPath = '';
-      if (key.includes('.')) {
-          const parts = key.split('.');
-          let currentPath = jsonField;
-          for(let i = 0; i < parts.length; i++) {
-              const part = parts[i];
-              const isLastPart = i === parts.length - 1;
-              const isNumericIndex = /^\d+$/.test(part);
-              
-              if (isNumericIndex) { 
-                currentPath += `->${part}`;
-              } else { 
-                currentPath += `->'${part}'`; 
-              }
-              
-              if (isLastPart) {
-                  const basePathMatch = currentPath.match(/^(.*)(->'[^']+'|->\d+)$/);
-                  const basePath = basePathMatch ? basePathMatch[1] : jsonField;
-                  if (isNumericIndex) { 
-                    accessPath = `${basePath}->>${part}`; 
-                  } else { 
-                    accessPath = `${basePath}->>'${part}'`; 
-                  }
-              }
-          }
-          if (!accessPath) accessPath = `${jsonField}->>'${key}'`;
-      } else {
-          accessPath = `${jsonField}->>'${key}'`;
+      const pgDirection = direction === 1 ? "ASC" : "DESC";
+
+      if (key === "$natural") return `id ${pgDirection}`;
+      if (key === "$textScore") {
+        if (!this.#textQuery)
+          throw new QueryError("$textScore sort requires a $text filter");
+        return `ts_rank(${this.#textVector(jsonField)}, ${this.#textQuery}) ${pgDirection}`;
       }
-      
-      return `${accessPath} ${pgDirection}`;
+
+      let accessPath = "";
+      if (key.includes(".")) {
+        const parts = key.split(".");
+        let currentPath = jsonField;
+        for (let i = 0; i < parts.length; i++) {
+          const part = parts[i];
+          const isLastPart = i === parts.length - 1;
+          const isNumericIndex = /^\d+$/.test(part);
+
+          if (isNumericIndex) {
+            currentPath += `->${part}`;
+          } else {
+            currentPath += `->'${this.#escapeKey(part)}'`;
+          }
+
+          if (isLastPart) {
+            // sort on the jsonb value (`->`), not its text form (`->>`):
+            // text extraction ordered numbers lexicographically ("9" > "80")
+            accessPath = currentPath;
+          }
+        }
+        if (!accessPath) accessPath = `${jsonField}->'${this.#escapeKey(key)}'`;
+      } else {
+        accessPath = `${jsonField}->'${this.#escapeKey(key)}'`;
+      }
+
+      return `${accessPath} ${pgDirection} NULLS LAST`;
     });
-    return ` ORDER BY ${sortClauses.join(', ')}`;
+    return ` ORDER BY ${sortClauses.join(", ")}`;
   }
 
   #buildJsonbPath(fieldPath: string): string {
     // Convert dot notation 'a.b.c' to Postgres jsonb path literal '{ "a", "b", "c" }'
     // Use JSON.stringify for robust quoting of path segments
-    const segments = fieldPath.split('.').map(p => JSON.stringify(p)); 
-    // Return the literal directly, wrapped in single quotes for SQL
-    return `'{${segments.join(',')}}'`;
+    const segments = fieldPath.split(".").map((p) => JSON.stringify(p));
+    // Return the literal directly, wrapped in single quotes for SQL; embedded
+    // single quotes are doubled so a key cannot end the literal
+    return `'{${segments.join(",").replace(/'/g, "''")}}'`;
   }
 
-  #buildJsonbAccessPath(fieldPath: string, jsonField: string): string {
-    const parts = fieldPath.split('.');
-    let currentPath = this.#quoteIdent(jsonField);
-    for (let i = 0; i < parts.length; i++) {
-      const part = parts[i];
-      const quotedPart = this.#quoteLiteral(part);
-      const isLast = i === parts.length - 1;
-      currentPath += isLast ? `->>${quotedPart}` : `->${quotedPart}`;
-    }
-    return currentPath;
+  // find({ select }): only the named top-level fields, rebuilt as the json
+  // column so row handling stays the same
+  #projection(fields: string[], jsonField: string): string {
+    if (!Array.isArray(fields) || !fields.length)
+      throw new QueryError("select requires at least one field");
+    // jsonb_build_object takes at most 100 arguments, two per field
+    if (fields.length > 50)
+      throw new QueryError("select takes at most 50 fields");
+    const column = this.#quoteIdent(jsonField);
+    const pairs = fields.map((field) => {
+      if (typeof field !== "string" || field.includes("."))
+        throw new QueryError(`select takes top-level fields: ${field}`);
+      const key = this.#escapeKey(field);
+      return `'${key}', ${column}->'${key}'`;
+    });
+    return `jsonb_build_object(${pairs.join(", ")}) AS ${column}`;
+  }
+
+  // the tsvector $text matches and ranks against. Kept textually identical
+  // to the expression a GIN index would be built on, so the index serves it.
+  #textVector(jsonField: string): string {
+    const parts = (this.#textFields ?? []).map(
+      (field) => `coalesce(${jsonField}->>'${this.#escapeKey(field)}', '')`,
+    );
+    return `to_tsvector('english', ${parts.join(" || ' ' || ")})`;
   }
 
   #quoteIdent(ident: string): string {
@@ -714,5 +1061,12 @@ export class MongoToPG {
 
   #quoteLiteral(value: string): string {
     return `'${value.replace(/'/g, "''")}'`;
+  }
+
+  // escape a user-supplied JSON key for safe interpolation between single
+  // quotes in a jsonb path (data->'<key>'). doubles embedded single quotes so
+  // a filter/sort key can never break out of the string literal (SQL injection).
+  #escapeKey(key: string): string {
+    return key.replace(/'/g, "''");
   }
 }

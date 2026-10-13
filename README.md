@@ -205,6 +205,122 @@ pgorm.events.on('products:created', (product) => {
 });
 ```
 
+Events are delivered after the surrounding transaction commits, and never
+for one that rolls back. The listener receives a detached copy of the
+document. Use `afterCommit(callback)` to defer your own work the same way.
+
+### Row Locks
+
+Inside a transaction, `find`, `findOne`, and `find1` can lock the rows they
+read. Outside a transaction they throw, because the lock would be released
+at once.
+
+```typescript
+import { transaction, advisoryLock } from 'pg-orm';
+
+await transaction(async () => {
+  const user = await User.find1(userId, { lock: 'update' });
+  // 'nowait' raises instead of waiting, 'skipLocked' skips held rows
+
+  await advisoryLock(`payout:${userId}`); // serialize on any string key
+});
+```
+
+### Bulk Updates and Queue Claims
+
+`updateOne` and `updateMany` accept `$set`, `$inc`, `$min`, and
+`$setIfNull`. They skip hooks and do not change `_vers`. With `sort`,
+`limit`, or `lock`, `updateMany` updates only the selected rows in one
+statement:
+
+```typescript
+const { documents } = await Job.updateMany(
+  { status: 'pending' },
+  { $set: { status: 'processing' }, $inc: { attempts: 1 } },
+  { sort: { _ctime: 1 }, limit: 50, lock: 'skipLocked', returning: true }
+);
+```
+
+### Aggregates
+
+```typescript
+const rows = await Order.aggregate(
+  { status: 'paid' },
+  {
+    by: { day: { $day: '_ctime' } },
+    fields: {
+      orders: { $count: true },
+      buyers: { $countDistinct: 'userId' },
+      revenue: { $sum: 'amount' },
+      refunds: { $count: true, where: { refunded: true } }
+    },
+    sort: { day: 1 }
+  }
+);
+```
+
+Fields support `$count`, `$countDistinct`, `$sum`, `$min`, `$max`, and
+`$bytes`. `$day` groups a millisecond timestamp by date in the database
+session's time zone.
+
+### More Query Options
+
+```typescript
+// plain objects holding only the named top-level fields
+await User.find({}, { select: ['_id', 'email'] });
+
+// case-insensitive equality; an index on lower(data->>'email') serves it
+await User.findOne({ email: { $ieq: 'Ada@Example.com' } });
+
+// insertion order
+await User.find({}, { sort: { $natural: -1 } });
+
+// insert unless a unique index rejects the row; returns null if it does
+await User.create({ name, email }, { ifAbsent: true });
+```
+
+Full-text search needs `textFields` on the schema:
+
+```typescript
+const Article = defineSchema('articles', schema, {
+  textFields: ['title', 'body']
+});
+
+await Article.find(
+  { $text: { $search: 'postgres json' } },
+  { sort: { $textScore: -1 } }
+);
+```
+
+The search compiles to
+`to_tsvector('english', coalesce(data->>'title', '') || ' ' || coalesce(data->>'body', ''))`.
+Create a GIN index on that exact expression to serve it.
+
+## Behavior Changes
+
+These differ from earlier versions:
+
+- Unknown filter and update operators, a non-array `$and`/`$or`/`$nor`,
+  and a non-number `$inc` throw `QueryError` (`status` 400). They used to
+  be logged and then dropped or replaced by a constant, which could widen
+  an update or delete. `$where` already threw and now throws `QueryError`.
+- Filter operands are bound as parameters instead of written into the SQL
+  text, and quotes in filter, sort, and update keys are escaped.
+- `$text` throws without `textFields`. It used to match every row.
+- Sorting compares JSON values, so numbers order numerically, and documents
+  missing the field sort last. It used to compare their text.
+- Events fire after commit with a detached copy of the document. Listeners
+  run outside the transaction, and an error a listener throws is logged
+  instead of rejecting `save()` or `remove()`.
+- A failure inside a nested `transaction()` rolls back the outer one even
+  if the caller catches the error. A transaction that Postgres aborted
+  throws at commit even if the callback swallowed the error.
+- Document data must be structured-cloneable: a function-valued property
+  throws `DataCloneError`.
+- `create()` ignores a supplied `_vers`, so it always inserts.
+- `isModified(path)` also reports a field assigned directly since load.
+- The library no longer logs on connect or when it creates the database.
+
 ## Environment
 
 ```bash
