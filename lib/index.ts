@@ -1,6 +1,6 @@
-export { defineSchema } from './schema';
-export { Document, OptimisticLockError } from './document';
-export { events, transaction } from './connection';
+export { defineSchema } from "./schema";
+export { Document, OptimisticLockError } from "./document";
+export { events, transaction } from "./connection";
 export type {
   SchemaDefinition,
   FieldConfig,
@@ -9,5 +9,5 @@ export type {
   FindOptions,
   SortDirection,
   SortOptions,
-  InferSchemaType
-} from './types'; 
+  InferSchemaType,
+} from "./types";

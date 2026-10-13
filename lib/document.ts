@@ -1,20 +1,20 @@
-import { nanoid } from 'nanoid';
-import type { SchemaDefinition, SchemaOptions } from './types';
-import { getConnection } from './connection';
-import { events } from './connection';
-import { singularize } from './utils';
+import { nanoid } from "nanoid";
+import type { SchemaDefinition, SchemaOptions } from "./types";
+import { getConnection } from "./connection";
+import { events } from "./connection";
+import { singularize } from "./utils";
 
 // generate prefixed id
 function generateId(collectionName: string): string {
-  if (!collectionName) return nanoid(); 
+  if (!collectionName) return nanoid();
   const prefix = singularize(collectionName).toLowerCase();
   return `${prefix}_${nanoid()}`;
 }
 
 export class OptimisticLockError extends Error {
-  constructor(message = 'Document was modified by another process') {
+  constructor(message = "Document was modified by another process") {
     super(message);
-    this.name = 'OptimisticLockError';
+    this.name = "OptimisticLockError";
   }
 }
 
@@ -28,32 +28,33 @@ export class Document<T> {
   #modifiedPaths: Set<string> = new Set();
 
   constructor(
-    data: Partial<T>, 
-    schema: SchemaDefinition, 
+    data: Partial<T>,
+    schema: SchemaDefinition,
     collectionName: string,
-    options?: SchemaOptions
+    options?: SchemaOptions,
   ) {
     Object.assign(this, data);
     this.#schema = schema;
     this.#collectionName = collectionName;
-    this.#originalVersion = (typeof (data as any)._vers === 'number' && (data as any)._vers > 0) 
-                              ? (data as any)._vers 
-                              : undefined;
+    this.#originalVersion =
+      typeof (data as any)._vers === "number" && (data as any)._vers > 0
+        ? (data as any)._vers
+        : undefined;
     this.#options = options;
-    
+
     if (this._id === undefined) {
       this._id = generateId(collectionName);
     }
     if (this._ctime === undefined) {
       this._ctime = Date.now();
     }
-     if (this._mtime === undefined) {
+    if (this._mtime === undefined) {
       this._mtime = this._ctime;
     }
-    
-    Object.defineProperty(this, Symbol.for('nodejs.util.inspect.custom'), {
+
+    Object.defineProperty(this, Symbol.for("nodejs.util.inspect.custom"), {
       enumerable: false,
-      value: () => this.toJSON()
+      value: () => this.toJSON(),
     });
   }
 
@@ -67,7 +68,11 @@ export class Document<T> {
   // Method to check if the document is considered new (not yet saved or version 0)
   isNew(): boolean {
     // Based on the logic used in save(): considers new if originalVersion is undefined/0
-    return !(typeof this.#originalVersion === 'number' && this.#originalVersion > 0 && this._id);
+    return !(
+      typeof this.#originalVersion === "number" &&
+      this.#originalVersion > 0 &&
+      this._id
+    );
   }
 
   // Method to check if the document is being updated (opposite of new)
@@ -78,9 +83,9 @@ export class Document<T> {
     } else {
       // Check if the specific path or any parent path was marked modified
       if (this.#modifiedPaths.has(path)) return true;
-      const parts = path.split('.');
+      const parts = path.split(".");
       for (let i = parts.length - 1; i > 0; i--) {
-        if (this.#modifiedPaths.has(parts.slice(0, i).join('.'))) {
+        if (this.#modifiedPaths.has(parts.slice(0, i).join("."))) {
           return true;
         }
       }
@@ -89,11 +94,11 @@ export class Document<T> {
   }
 
   toJSON() {
-    const baseFields = ['_id', '_vers', '_ctime', '_mtime', '_deletedAt'];
+    const baseFields = ["_id", "_vers", "_ctime", "_mtime", "_deletedAt"];
     const schemaFields = Object.keys(this.#schema);
     const allowedKeys = new Set([...baseFields, ...schemaFields]);
     return Object.fromEntries(
-      Object.entries(this).filter(([key]) => allowedKeys.has(key))
+      Object.entries(this).filter(([key]) => allowedKeys.has(key)),
     );
   }
 
@@ -112,20 +117,22 @@ export class Document<T> {
         try {
           await Promise.resolve(config.validate.call(validationContext, value));
         } catch (err) {
-          errors.push(`${field}: ${err instanceof Error ? err.message : String(err)}`);
+          errors.push(
+            `${field}: ${err instanceof Error ? err.message : String(err)}`,
+          );
         }
       }
     }
-    
+
     return { valid: errors.length === 0, errors };
   }
 
   async save(): Promise<Document<T>> {
     const db = await getConnection();
     const validation = await this.#validate();
-    
+
     if (!validation.valid) {
-      throw new Error(`Validation failed: ${validation.errors.join(', ')}`);
+      throw new Error(`Validation failed: ${validation.errors.join(", ")}`);
     }
 
     // Use the helper method now
@@ -138,34 +145,55 @@ export class Document<T> {
 
     if (isUpdate) {
       if (!this._id) throw new Error("Cannot update document without _id");
-      if (typeof this.#originalVersion !== 'number') {
-        throw new Error("Cannot update document without original version for optimistic locking.");
+      if (typeof this.#originalVersion !== "number") {
+        throw new Error(
+          "Cannot update document without original version for optimistic locking.",
+        );
       }
       this._mtime = Date.now();
       const saveData = this.toJSON();
       saveData._vers = (this._vers || 0) + 1;
 
       for (const [field, config] of Object.entries(this.#schema)) {
-        if (config.type === 'ref' && this.#_populated[field] && typeof this[field] === 'object' && this[field]?._id) {
-          saveData[field] = this[field]._id; 
+        if (
+          config.type === "ref" &&
+          this.#_populated[field] &&
+          typeof this[field] === "object" &&
+          this[field]?._id
+        ) {
+          saveData[field] = this[field]._id;
         }
-        if (config.type === 'array' && config.of.type === 'ref' && this.#_populated[field] && Array.isArray(this[field])) {
-           saveData[field] = this[field].map((item: any) => (typeof item === 'object' && item?._id) ? item._id : item);
+        if (
+          config.type === "array" &&
+          config.of.type === "ref" &&
+          this.#_populated[field] &&
+          Array.isArray(this[field])
+        ) {
+          saveData[field] = this[field].map((item: any) =>
+            typeof item === "object" && item?._id ? item._id : item,
+          );
         }
       }
-      
+
       const { rows } = await db.query(
         `UPDATE ${this.#collectionName} SET data = $1 WHERE data->>'_id' = $2 AND (data->>'_vers')::int = $3 RETURNING data`,
-        [saveData, this._id, this.#originalVersion]
+        [saveData, this._id, this.#originalVersion],
       );
 
       if (rows.length === 0) {
-        const existsCheck = await db.query(`SELECT data->>'_vers' as version FROM ${this.#collectionName} WHERE data->>'_id' = $1`, [this._id]);
+        const existsCheck = await db.query(
+          `SELECT data->>'_vers' as version FROM ${this.#collectionName} WHERE data->>'_id' = $1`,
+          [this._id],
+        );
         if (existsCheck.rowCount === 0) {
-            throw new Error(`Document with _id ${this._id} not found for update.`);
+          throw new Error(
+            `Document with _id ${this._id} not found for update.`,
+          );
         }
         const currentDbVersion = existsCheck.rows[0].version;
-        throw new OptimisticLockError(`Optimistic lock failed for _id ${this._id}. Expected version ${this.#originalVersion}, but found ${currentDbVersion}.`);
+        throw new OptimisticLockError(
+          `Optimistic lock failed for _id ${this._id}. Expected version ${this.#originalVersion}, but found ${currentDbVersion}.`,
+        );
       }
 
       this._vers = saveData._vers;
@@ -173,7 +201,6 @@ export class Document<T> {
       this.#_populated = {};
       this.#modifiedPaths.clear();
       events.emit(`${this.#collectionName}:updated`, this);
-
     } else {
       this._id = this._id || generateId(this.#collectionName);
       const nowMillis = Date.now();
@@ -185,17 +212,29 @@ export class Document<T> {
       if (saveData._vers === undefined) saveData._vers = this._vers;
 
       for (const [field, config] of Object.entries(this.#schema)) {
-        if (config.type === 'ref' && this.#_populated[field] && typeof this[field] === 'object' && this[field]?._id) {
-          saveData[field] = this[field]._id; 
+        if (
+          config.type === "ref" &&
+          this.#_populated[field] &&
+          typeof this[field] === "object" &&
+          this[field]?._id
+        ) {
+          saveData[field] = this[field]._id;
         }
-         if (config.type === 'array' && config.of.type === 'ref' && this.#_populated[field] && Array.isArray(this[field])) {
-           saveData[field] = this[field].map((item: any) => (typeof item === 'object' && item?._id) ? item._id : item);
+        if (
+          config.type === "array" &&
+          config.of.type === "ref" &&
+          this.#_populated[field] &&
+          Array.isArray(this[field])
+        ) {
+          saveData[field] = this[field].map((item: any) =>
+            typeof item === "object" && item?._id ? item._id : item,
+          );
         }
       }
 
       const { rows } = await db.query(
         `INSERT INTO ${this.#collectionName} (data) VALUES ($1) RETURNING data`,
-        [saveData]
+        [saveData],
       );
 
       this.#originalVersion = this._vers;
@@ -211,7 +250,10 @@ export class Document<T> {
     return this;
   }
 
-  async #checkExists(id: string | undefined = this._id, version?: number): Promise<boolean> {
+  async #checkExists(
+    id: string | undefined = this._id,
+    version?: number,
+  ): Promise<boolean> {
     if (!id) return false;
     const db = await getConnection();
     let sql = `SELECT 1 FROM ${this.#collectionName} WHERE data->>'_id' = $1`;
@@ -224,57 +266,84 @@ export class Document<T> {
     return (rowCount ?? 0) > 0;
   }
 
-  private async populateRef(field: string, fieldConfig: { type: 'ref'; ref: string }): Promise<void> {
-    if (!this[field] || typeof this[field] !== 'string') return;
-    
+  private async populateRef(
+    field: string,
+    fieldConfig: { type: "ref"; ref: string },
+  ): Promise<void> {
+    if (!this[field] || typeof this[field] !== "string") return;
+
     const db = await getConnection();
     const { rows } = await db.query(
       `SELECT data FROM ${fieldConfig.ref} WHERE data->>'_id' = $1`,
-      [this[field]]
+      [this[field]],
     );
 
     if (rows[0]) {
-      this[field] = new Document(rows[0].data, this.#schema, fieldConfig.ref /*, this.#hooks */);
+      this[field] = new Document(
+        rows[0].data,
+        this.#schema,
+        fieldConfig.ref /*, this.#hooks */,
+      );
       this.#_populated[field] = true;
     }
   }
 
-  private async populateArray(field: string, fieldConfig: { type: 'array'; of: any }): Promise<void> {
+  private async populateArray(
+    field: string,
+    fieldConfig: { type: "array"; of: any },
+  ): Promise<void> {
     if (!Array.isArray(this[field]) || this[field].length === 0) return;
 
-    const idsToPopulate = this[field].filter(item => typeof item === 'string');
+    const idsToPopulate = this[field].filter(
+      (item) => typeof item === "string",
+    );
     if (idsToPopulate.length === 0) return;
 
-    if (fieldConfig.of.type === 'ref') {
+    if (fieldConfig.of.type === "ref") {
       const db = await getConnection();
       const { rows } = await db.query(
         `SELECT data FROM ${fieldConfig.of.ref} WHERE data->>'_id' = ANY($1::text[])`,
-        [idsToPopulate]
+        [idsToPopulate],
       );
 
       const docsById = Object.fromEntries(
-        rows.map(row => [
+        rows.map((row) => [
           row.data._id,
-          new Document(row.data, this.#schema, fieldConfig.of.ref)
-        ])
+          new Document(row.data, this.#schema, fieldConfig.of.ref),
+        ]),
       );
-      
+
       this[field] = this[field].map((item: any) => docsById[item] || item);
       this.#_populated[field] = true;
     }
   }
 
-  private async populateNestedRef(field: string, item: any, nestedField: string, refConfig: { type: 'ref'; ref: string }): Promise<void> {
-    if (!item || typeof item !== 'object' || !item[nestedField] || typeof item[nestedField] !== 'string') return;
+  private async populateNestedRef(
+    field: string,
+    item: any,
+    nestedField: string,
+    refConfig: { type: "ref"; ref: string },
+  ): Promise<void> {
+    if (
+      !item ||
+      typeof item !== "object" ||
+      !item[nestedField] ||
+      typeof item[nestedField] !== "string"
+    )
+      return;
 
     const db = await getConnection();
     const { rows } = await db.query(
       `SELECT data FROM ${refConfig.ref} WHERE data->>'_id' = $1`,
-      [item[nestedField]]
+      [item[nestedField]],
     );
 
     if (rows[0]) {
-      item[nestedField] = new Document(rows[0].data, this.#schema, refConfig.ref);
+      item[nestedField] = new Document(
+        rows[0].data,
+        this.#schema,
+        refConfig.ref,
+      );
     }
   }
 
@@ -282,7 +351,7 @@ export class Document<T> {
     const fieldsArray = Array.isArray(fields) ? fields : [fields];
 
     for (const field of fieldsArray) {
-      const parts = field.split('.');
+      const parts = field.split(".");
       const rootField = parts[0];
       const nestedField = parts[1];
 
@@ -290,20 +359,33 @@ export class Document<T> {
       if (!fieldConfig) continue;
 
       if (parts.length === 1) {
-        if (fieldConfig.type === 'ref') {
-          await this.populateRef(rootField, fieldConfig as { type: 'ref'; ref: string });
-        } else if (fieldConfig.type === 'array' && fieldConfig.of.type === 'ref') {
+        if (fieldConfig.type === "ref") {
+          await this.populateRef(
+            rootField,
+            fieldConfig as { type: "ref"; ref: string },
+          );
+        } else if (
+          fieldConfig.type === "array" &&
+          fieldConfig.of.type === "ref"
+        ) {
           await this.populateArray(rootField, fieldConfig as any);
         }
       } else if (parts.length === 2 && nestedField) {
-        if (fieldConfig.type === 'array' && fieldConfig.of.type === 'object') {
+        if (fieldConfig.type === "array" && fieldConfig.of.type === "object") {
           const nestedSchema = fieldConfig.of.schema;
-          const nestedConfig = nestedSchema ? nestedSchema[nestedField] : undefined;
+          const nestedConfig = nestedSchema
+            ? nestedSchema[nestedField]
+            : undefined;
 
-          if (nestedConfig?.type === 'ref') {
+          if (nestedConfig?.type === "ref") {
             if (Array.isArray(this[rootField])) {
               for (const item of this[rootField]) {
-                await this.populateNestedRef(rootField, item, nestedField, nestedConfig as { type: 'ref'; ref: string });
+                await this.populateNestedRef(
+                  rootField,
+                  item,
+                  nestedField,
+                  nestedConfig as { type: "ref"; ref: string },
+                );
               }
               this.#_populated[field] = true;
             }
@@ -325,31 +407,31 @@ export class Document<T> {
     if (this.#options?.softDelete) {
       this._deletedAt = Date.now();
       const saveData = this.toJSON();
-      
+
       // Update the document to set _deletedAt
       // We don't increment version for delete as it's a "terminal" state in some views, but technically it's an update.
       // Let's treat it as a special update that doesn't necessarily need strict version checks if we consider it a delete?
       // No, for consistency, we should probably check version if we want to be safe, but typically delete is "delete whatever matches ID".
       // However, if we soft delete, it IS an update.
       // Let's do a simple update by ID.
-      
+
       await db.query(
         `UPDATE ${this.#collectionName} SET data = $1 WHERE data->>'_id' = $2`,
-        [saveData, this._id]
+        [saveData, this._id],
       );
     } else {
       await db.query(
         `DELETE FROM ${this.#collectionName} WHERE data->>'_id' = $1`,
-        [this._id]
+        [this._id],
       );
     }
-    
+
     events.emit(`${this.#collectionName}:removed`, this);
 
     if (this.#options?.hooks?.postRemove) {
       await Promise.resolve(this.#options.hooks.postRemove.call(this));
     }
-    
+
     Object.freeze(this);
   }
-} 
+}

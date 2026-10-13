@@ -1,9 +1,9 @@
-import { defineSchema } from './lib/schema';
-import { transaction, events } from './lib/connection';
-import { Document, OptimisticLockError } from './lib/document';
+import { defineSchema } from "./lib/schema";
+import { transaction, events } from "./lib/connection";
+import { Document, OptimisticLockError } from "./lib/document";
 
 // export individual items for those who need them
-export * from './lib';
+export * from "./lib";
 
 // export unified API object for simpler usage
 export const pgorm = {
@@ -12,6 +12,6 @@ export const pgorm = {
   events,
   Document,
   errors: {
-    OptimisticLockError
-  }
-} as const; 
+    OptimisticLockError,
+  },
+} as const;
