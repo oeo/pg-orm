@@ -16,6 +16,6 @@ export function renumberPlaceholders(
 ): string {
   return sql.replace(
     /\$(\d+)/g,
-    (_, num) => `$${parseInt(num) + startingIndex}`,
+    (_, num) => `$${parseInt(num, 10) + startingIndex}`,
   );
 }

@@ -1,7 +1,7 @@
 import { nanoid } from "nanoid";
+import { isDeepStrictEqual } from "node:util";
+import { afterCommit, events, getConnection } from "./connection";
 import type { SchemaDefinition, SchemaOptions } from "./types";
-import { getConnection } from "./connection";
-import { events } from "./connection";
 import { singularize } from "./utils";
 
 // generate prefixed id
@@ -24,6 +24,7 @@ export class Document<T> {
   #schema: SchemaDefinition;
   #collectionName: string;
   #originalVersion?: number;
+  #originalValues: Record<string, any>;
   #options?: SchemaOptions;
   #modifiedPaths: Set<string> = new Set();
 
@@ -34,6 +35,7 @@ export class Document<T> {
     options?: SchemaOptions,
   ) {
     Object.assign(this, data);
+    this.#originalValues = structuredClone(data);
     this.#schema = schema;
     this.#collectionName = collectionName;
     this.#originalVersion =
@@ -89,7 +91,7 @@ export class Document<T> {
           return true;
         }
       }
-      return false;
+      return !isDeepStrictEqual(this[path], this.#originalValues[path]);
     }
   }
 
@@ -104,7 +106,6 @@ export class Document<T> {
 
   async #validate(): Promise<{ valid: boolean; errors: string[] }> {
     const errors: string[] = [];
-    const validationContext = this;
 
     for (const [field, config] of Object.entries(this.#schema)) {
       const value = this[field];
@@ -115,7 +116,7 @@ export class Document<T> {
 
       if (config.validate && value !== undefined) {
         try {
-          await Promise.resolve(config.validate.call(validationContext, value));
+          await Promise.resolve(config.validate.call(this, value));
         } catch (err) {
           errors.push(
             `${field}: ${err instanceof Error ? err.message : String(err)}`,
@@ -127,7 +128,17 @@ export class Document<T> {
     return { valid: errors.length === 0, errors };
   }
 
-  async save(): Promise<Document<T>> {
+  /**
+   * Insert or update this document. `{ ifAbsent: true }` applies to inserts
+   * only: the INSERT carries ON CONFLICT DO NOTHING, and when a unique index
+   * rejects the row, save resolves to null with no created event and no
+   * postSave hook. preSave has already run by then.
+   */
+  save(): Promise<Document<T>>;
+  save(options: { ifAbsent: true }): Promise<Document<T> | null>;
+  async save(
+    options: { ifAbsent?: boolean } = {},
+  ): Promise<Document<T> | null> {
     const db = await getConnection();
     const validation = await this.#validate();
 
@@ -137,6 +148,8 @@ export class Document<T> {
 
     // Use the helper method now
     const isUpdate = !this.isNew();
+    if (isUpdate && options.ifAbsent)
+      throw new Error("ifAbsent applies only to new documents");
 
     if (this.#options?.hooks?.preSave) {
       // The hook can now call this.isNew() or this.isModified()
@@ -200,7 +213,7 @@ export class Document<T> {
       this.#originalVersion = this._vers;
       this.#_populated = {};
       this.#modifiedPaths.clear();
-      events.emit(`${this.#collectionName}:updated`, this);
+      this.#emit("updated");
     } else {
       this._id = this._id || generateId(this.#collectionName);
       const nowMillis = Date.now();
@@ -233,37 +246,37 @@ export class Document<T> {
       }
 
       const { rows } = await db.query(
-        `INSERT INTO ${this.#collectionName} (data) VALUES ($1) RETURNING data`,
+        `INSERT INTO ${this.#collectionName} (data) VALUES ($1)${options.ifAbsent ? " ON CONFLICT DO NOTHING" : ""} RETURNING data`,
         [saveData],
       );
+      if (!rows.length) return null;
 
       this.#originalVersion = this._vers;
       this.#_populated = {};
       this.#modifiedPaths.clear();
-      events.emit(`${this.#collectionName}:created`, this);
+      this.#emit("created");
     }
 
     if (this.#options?.hooks?.postSave) {
       await Promise.resolve(this.#options.hooks.postSave.call(this));
     }
 
+    this.#originalValues = structuredClone(this.toJSON());
+
     return this;
   }
 
-  async #checkExists(
-    id: string | undefined = this._id,
-    version?: number,
-  ): Promise<boolean> {
-    if (!id) return false;
-    const db = await getConnection();
-    let sql = `SELECT 1 FROM ${this.#collectionName} WHERE data->>'_id' = $1`;
-    const params: any[] = [id];
-    if (version !== undefined) {
-      sql += ` AND (data->>'_vers')::int = $2`;
-      params.push(version);
-    }
-    const { rowCount } = await db.query(sql, params);
-    return (rowCount ?? 0) > 0;
+  // Listeners get a detached copy, delivered once the transaction commits
+  #emit(event: string): void {
+    const snapshot = new Document(
+      structuredClone(this.toJSON()),
+      this.#schema,
+      this.#collectionName,
+      this.#options,
+    );
+    afterCommit(() =>
+      events.emit(`${this.#collectionName}:${event}`, snapshot),
+    );
   }
 
   private async populateRef(
@@ -372,7 +385,7 @@ export class Document<T> {
         }
       } else if (parts.length === 2 && nestedField) {
         if (fieldConfig.type === "array" && fieldConfig.of.type === "object") {
-          const nestedSchema = fieldConfig.of.schema;
+          const nestedSchema = (fieldConfig.of as any).schema;
           const nestedConfig = nestedSchema
             ? nestedSchema[nestedField]
             : undefined;
@@ -426,7 +439,7 @@ export class Document<T> {
       );
     }
 
-    events.emit(`${this.#collectionName}:removed`, this);
+    this.#emit("removed");
 
     if (this.#options?.hooks?.postRemove) {
       await Promise.resolve(this.#options.hooks.postRemove.call(this));

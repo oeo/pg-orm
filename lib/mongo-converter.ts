@@ -1,9 +1,41 @@
-import { isDeepStrictEqual } from "util"; // Use built-in util for deep comparison
-import type { SortDirection } from "./types"; // Import SortDirection type if it's not already imported (assuming it's in ./types)
+import type { AggregateOptions, LockMode, SortDirection } from "./types";
+
+const LOCK_CLAUSES: Record<LockMode, string> = {
+  update: "FOR UPDATE",
+  nowait: "FOR UPDATE NOWAIT",
+  skipLocked: "FOR UPDATE SKIP LOCKED",
+};
+
+/**
+ * A filter or update the converter does not understand. It fails closed: a
+ * dropped operator would widen an update or delete to every row. Carries
+ * status 400 so an HTTP layer can answer a bad client filter as a bad request.
+ */
+export class QueryError extends Error {
+  readonly status = 400;
+  constructor(message: string) {
+    super(message);
+    this.name = "QueryError";
+  }
+}
+
+export function lockClause(lock: LockMode): string {
+  const clause = LOCK_CLAUSES[lock];
+  if (!clause) throw new Error(`unknown lock mode: ${lock}`);
+  return clause;
+}
 
 export class MongoToPG {
   // Internal state for parameters during a single conversion
   #params: any[] = [];
+  // fields `$text` searches (SchemaOptions.textFields)
+  #textFields?: string[];
+  // placeholder of the last `$text` search, reused by a `$textScore` sort
+  #textQuery?: string;
+
+  constructor(options: { textFields?: string[] } = {}) {
+    this.#textFields = options.textFields;
+  }
 
   // Helper to add a parameter and return its placeholder
   #addParam(value: any): string {
@@ -13,6 +45,8 @@ export class MongoToPG {
 
   /**
    * Converts MongoDB query object to parameterized SQL query parts for SELECT.
+   * `columns` replaces the selected column list (default: the json column);
+   * `lock` appends a row-locking clause after LIMIT/OFFSET.
    * @returns Object containing { sql: string, params: any[] }
    */
   buildSelectQueryAndParams(
@@ -24,9 +58,13 @@ export class MongoToPG {
       limit?: number;
       offset?: number; // Added offset support
       sort?: Record<string, SortDirection>; // Use SortDirection type
+      columns?: string;
+      lock?: LockMode;
+      select?: string[];
     } = {},
   ): { sql: string; params: any[] } {
     this.#params = []; // Reset parameters for this conversion
+    this.#textQuery = undefined;
     const {
       jsonField = "data",
       schema: schemaOption,
@@ -40,7 +78,10 @@ export class MongoToPG {
       : this.#quoteIdent(collection);
     const whereClause = this.#buildWhereClause(query, jsonField);
 
-    let sqlQuery = `SELECT ${this.#quoteIdent(jsonField)} FROM ${tableRef}`;
+    const columns = options.select
+      ? this.#projection(options.select, jsonField)
+      : (options.columns ?? this.#quoteIdent(jsonField));
+    let sqlQuery = `SELECT ${columns} FROM ${tableRef}`;
 
     // Fix 1: Be absolutely explicit about checking for 'TRUE' string
     if (whereClause === "TRUE") {
@@ -54,25 +95,108 @@ export class MongoToPG {
       sqlQuery += this.#buildSortClause(sort, jsonField);
     if (limit !== undefined && limit > 0) sqlQuery += ` LIMIT ${limit}`;
     if (offset !== undefined && offset > 0) sqlQuery += ` OFFSET ${offset}`; // Handle offset
+    if (options.lock) sqlQuery += ` ${lockClause(options.lock)}`;
 
     return { sql: sqlQuery.trim(), params: this.#params };
   }
 
   /**
    * Builds only the WHERE clause and parameters from a MongoDB query object.
+   * Placeholders continue after `params`, which are returned first, so
+   * several filters can share one statement without renumbering.
    * @returns Object containing { whereClause: string (e.g., "WHERE ..."), params: any[] }
    */
   buildWhereClauseAndParams(
     query: Record<string, any>,
     jsonField: string = "data",
+    params: any[] = [],
   ): { whereClause: string; params: any[] } {
-    this.#params = []; // Reset parameters
+    this.#params = [...params];
+    this.#textQuery = undefined;
     const whereClause = this.#buildWhereClause(query, jsonField);
     // Return clause with "WHERE" prefix if not empty
     return {
       whereClause: whereClause ? `WHERE ${whereClause}` : "",
       params: this.#params,
     };
+  }
+
+  /**
+   * Builds one grouped SELECT for aggregate(). Group keys and filters go
+   * through the same converter as find(), and every value is a parameter.
+   * Output names are quoted identifiers; sort names must be outputs.
+   */
+  buildAggregateQueryAndParams(
+    collection: string,
+    query: Record<string, any>,
+    options: AggregateOptions,
+    jsonField: string = "data",
+  ): { sql: string; params: any[] } {
+    const column = this.#quoteIdent(jsonField);
+    const text = (path: string) =>
+      `${column} #>> ${this.#buildJsonbPath(path)}`;
+    const numeric = (path: string) => `(${text(path)})::numeric`;
+
+    const by = Object.entries(options.by ?? {});
+    const fields = Object.entries(options.fields);
+    if (!fields.length)
+      throw new QueryError("aggregate requires at least one field");
+
+    let params: any[] = [];
+    const columns: string[] = [];
+    for (const [name, key] of by) {
+      const expression =
+        typeof key === "string"
+          ? text(key)
+          : `to_timestamp(${numeric(key.$day)} / 1000)::date::text`;
+      columns.push(`${expression} AS ${this.#quoteIdent(name)}`);
+    }
+    for (const [name, spec] of fields) {
+      const { where, ...op } = spec as Record<string, any>;
+      let expression: string;
+      if ("$count" in op) expression = "COUNT(*)";
+      else if ("$countDistinct" in op)
+        expression = `COUNT(DISTINCT ${text(op.$countDistinct)})`;
+      else if ("$sum" in op) expression = `SUM(${numeric(op.$sum)})`;
+      else if ("$min" in op) expression = `MIN(${numeric(op.$min)})`;
+      else if ("$max" in op) expression = `MAX(${numeric(op.$max)})`;
+      // stored size of the whole document, as octet_length(jsonb::text)
+      else if ("$bytes" in op)
+        expression = `SUM(octet_length(${column}::text))`;
+      else throw new QueryError(`aggregate field ${name} has no operator`);
+      if (where && Object.keys(where).length) {
+        const built = this.buildWhereClauseAndParams(where, jsonField, params);
+        params = built.params;
+        if (built.whereClause) expression += ` FILTER (${built.whereClause})`;
+      }
+      // SUM over no rows is NULL; report 0 like COUNT does
+      if ("$sum" in op || "$bytes" in op)
+        expression = `COALESCE(${expression}, 0)`;
+      columns.push(`${expression} AS ${this.#quoteIdent(name)}`);
+    }
+
+    const built = this.buildWhereClauseAndParams(query, jsonField, params);
+    let sql = `SELECT ${columns.join(", ")} FROM ${this.#quoteIdent(collection)} ${built.whereClause}`;
+    if (by.length)
+      sql += ` GROUP BY ${by.map((_, index) => index + 1).join(", ")}`;
+
+    const outputs = new Set([...by, ...fields].map(([name]) => name));
+    const sort = Object.entries(options.sort ?? {});
+    if (sort.length) {
+      sql += ` ORDER BY ${sort
+        .map(([name, direction]) => {
+          if (!outputs.has(name))
+            throw new QueryError(`aggregate sort ${name} is not an output`);
+          return `${this.#quoteIdent(name)} ${direction === 1 ? "ASC" : "DESC"} NULLS LAST`;
+        })
+        .join(", ")}`;
+    }
+    if (options.limit !== undefined) {
+      if (!Number.isSafeInteger(options.limit) || options.limit < 1)
+        throw new QueryError("aggregate limit must be a positive integer");
+      sql += ` LIMIT ${options.limit}`;
+    }
+    return { sql: sql.trim(), params: built.params };
   }
 
   /**
@@ -94,19 +218,16 @@ export class MongoToPG {
           const stringifiedValue = JSON.stringify(value);
           const valuePlaceholder = this.#addParam(stringifiedValue);
           const jsonbExpression = `${valuePlaceholder}::jsonb`;
-          // Use jsonb_set_lax to create intermediate objects/arrays if they don't exist
+          // jsonb_set_lax creates only the last path segment: a nested path
+          // whose parent object is missing leaves the document unchanged
           currentExpression = `jsonb_set_lax(${currentExpression}::jsonb, ${pathArray}, ${jsonbExpression}, true)`;
           appliedOps++;
         }
       } else if (operator === "$inc") {
         if (typeof ops !== "object" || ops === null) continue;
         for (const [fieldPath, increment] of Object.entries(ops)) {
-          if (typeof increment !== "number") {
-            console.warn(
-              `Unsupported $inc value for path ${fieldPath}. Must be a number.`,
-            );
-            continue;
-          }
+          if (typeof increment !== "number")
+            throw new QueryError(`$inc ${fieldPath} must be a number`);
           const pathArray = this.#buildJsonbPath(fieldPath);
           const parts = fieldPath.split(".");
           let currentAccessPath = this.#quoteIdent(jsonField);
@@ -121,8 +242,32 @@ export class MongoToPG {
           currentExpression = `jsonb_set_lax(${currentExpression}::jsonb, ${pathArray}, ${incrementExpression}, true)`;
           appliedOps++;
         }
+      } else if (operator === "$min") {
+        // keep the smaller number: set when the stored value is missing,
+        // null, or larger. LEAST ignores NULL, so a missing value takes the
+        // operand. Numbers only; a stored non-number fails the cast.
+        if (typeof ops !== "object" || ops === null) continue;
+        for (const [fieldPath, value] of Object.entries(ops)) {
+          if (typeof value !== "number")
+            throw new QueryError(`$min ${fieldPath} must be a number`);
+          const pathArray = this.#buildJsonbPath(fieldPath);
+          const placeholder = this.#addParam(value);
+          const stored = `(${this.#quoteIdent(jsonField)} #>> ${pathArray})::numeric`;
+          currentExpression = `jsonb_set_lax(${currentExpression}::jsonb, ${pathArray}, to_jsonb(LEAST(${stored}, ${placeholder}::numeric)), true)`;
+          appliedOps++;
+        }
+      } else if (operator === "$setIfNull") {
+        // set only when the stored value is missing or JSON null
+        if (typeof ops !== "object" || ops === null) continue;
+        for (const [fieldPath, value] of Object.entries(ops)) {
+          const pathArray = this.#buildJsonbPath(fieldPath);
+          const placeholder = this.#addParam(JSON.stringify(value));
+          const stored = `${this.#quoteIdent(jsonField)} #> ${pathArray}`;
+          currentExpression = `jsonb_set_lax(${currentExpression}::jsonb, ${pathArray}, COALESCE(NULLIF(${stored}, 'null'::jsonb), ${placeholder}::jsonb), true)`;
+          appliedOps++;
+        }
       } else {
-        console.warn(`Unsupported update operator: ${operator}`);
+        throw new QueryError(`unsupported update operator: ${operator}`);
       }
     }
     return appliedOps > 0
@@ -147,19 +292,17 @@ export class MongoToPG {
     let isTrueResult = false;
 
     for (const [key, value] of Object.entries(query)) {
-      if (key === "$where") {
-        console.error(
-          "CRITICAL: Unsupported and potentially dangerous operator: $where. Query conversion aborted.",
-        );
-        throw new Error(
-          "$where operator is not supported due to security risks.",
-        );
-      }
+      if (key === "$where") throw new QueryError("$where is not supported");
       if (key === "$text") {
-        console.warn(
-          "Unsupported operator: $text (requires FTS configuration). Returning TRUE.",
-        );
-        isTrueResult = true;
+        // { $text: { $search: "words" } } -> websearch_to_tsquery match over
+        // SchemaOptions.textFields. Without textFields it throws rather than
+        // matching every row.
+        if (!this.#textFields?.length)
+          throw new QueryError("$text requires SchemaOptions.textFields");
+        if (typeof value?.$search !== "string")
+          throw new QueryError("$text requires { $search: string }");
+        this.#textQuery = `websearch_to_tsquery('english', ${this.#addParam(value.$search)})`;
+        clauses.push(`${this.#textVector(jsonField)} @@ ${this.#textQuery}`);
         continue;
       }
 
@@ -199,22 +342,17 @@ export class MongoToPG {
             const part = parts[i];
             const isLastPart = i === parts.length - 1;
             const isNumericIndex = /^\d+$/.test(part);
+            const basePath = currentJsonPath;
             if (isNumericIndex) {
               currentJsonPath += `->${part}`;
             } else {
-              currentJsonPath += `->\'${part}\'`;
+              currentJsonPath += `->'${this.#escapeKey(part)}'`;
             }
             if (isLastPart) {
-              const basePathMatch = currentJsonPath.match(
-                /^(.*)(->\'[^\']+\'|->\d+)$/,
-              );
-              const basePath = basePathMatch
-                ? basePathMatch[1]
-                : parentPath || jsonField;
               if (isNumericIndex) {
                 currentAccessPath = `${basePath}->>${part}`;
               } else {
-                currentAccessPath = `${basePath}->>\'${part}\'`;
+                currentAccessPath = `${basePath}->>'${this.#escapeKey(part)}'`;
               }
             }
           }
@@ -235,12 +373,13 @@ export class MongoToPG {
             );
           }
         } else {
+          const ek = this.#escapeKey(key);
           const currentJsonPath = parentPath
-            ? `${parentPath}->'${key}'`
-            : `${jsonField}->'${key}'`;
+            ? `${parentPath}->'${ek}'`
+            : `${jsonField}->'${ek}'`;
           const currentAccessPath = parentPath
-            ? `${parentPath}->>'${key}'`
-            : `${jsonField}->>'${key}'`;
+            ? `${parentPath}->>'${ek}'`
+            : `${jsonField}->>'${ek}'`;
 
           if (this.#isOperatorObject(value)) {
             fieldClause = this.#processFieldOperators(
@@ -276,7 +415,7 @@ export class MongoToPG {
           isTrueResult = true;
         }
       } else {
-        console.warn(`Unsupported operator used as field: ${key}`);
+        throw new QueryError(`unsupported operator: ${key}`);
       }
     }
 
@@ -285,7 +424,7 @@ export class MongoToPG {
     const validClauses = clauses.filter((c) => c && c !== "TRUE");
 
     if (validClauses.length === 0) {
-      // Return TRUE if isTrueResult was set (e.g. $text, or $nin:[])
+      // Return TRUE if isTrueResult was set (e.g. $nin:[])
       // OR if a logical operator returned TRUE (handled within logical operator logic)
       return isTrueResult ? "TRUE" : "";
     }
@@ -378,7 +517,7 @@ export class MongoToPG {
     jsonPath: string, // Ensure jsonPath is consistently available
     regexOptions?: string,
   ): string {
-    const sqlVal = (val: any) => this.#sqlValue(val);
+    const bind = (val: any) => this.#bindValue(val);
     const numericAccessPath = `(${accessPath})::numeric`;
     const booleanAccessPath = `(${accessPath})::boolean`;
 
@@ -387,7 +526,7 @@ export class MongoToPG {
         if (operand === undefined) return `${jsonPath} IS NULL`; // Use jsonPath
         return this.#createEqualityCondition(accessPath, jsonPath, operand); // Passes jsonPath
 
-      case "$ne":
+      case "$ne": {
         if (operand === undefined) return `${jsonPath} IS NOT NULL`; // Use jsonPath
         if (operand === null) {
           // Fix: Use jsonPath directly for null checks
@@ -414,26 +553,27 @@ export class MongoToPG {
           return `(${accessPath})::${cast} IS DISTINCT FROM ${neValuePlaceholder}`;
         }
         return `${accessPath} IS DISTINCT FROM ${neValuePlaceholder}`;
+      }
 
       case "$gt":
         return typeof operand === "number"
-          ? `${numericAccessPath} > ${sqlVal(operand)}`
-          : `${accessPath} > ${sqlVal(operand)}`;
+          ? `${numericAccessPath} > ${bind(operand)}`
+          : `${accessPath} > ${bind(operand)}`;
 
       case "$gte":
         return typeof operand === "number"
-          ? `${numericAccessPath} >= ${sqlVal(operand)}`
-          : `${accessPath} >= ${sqlVal(operand)}`;
+          ? `${numericAccessPath} >= ${bind(operand)}`
+          : `${accessPath} >= ${bind(operand)}`;
 
       case "$lt":
         return typeof operand === "number"
-          ? `${numericAccessPath} < ${sqlVal(operand)}`
-          : `${accessPath} < ${sqlVal(operand)}`;
+          ? `${numericAccessPath} < ${bind(operand)}`
+          : `${accessPath} < ${bind(operand)}`;
 
       case "$lte":
         return typeof operand === "number"
-          ? `${numericAccessPath} <= ${sqlVal(operand)}`
-          : `${accessPath} <= ${sqlVal(operand)}`;
+          ? `${numericAccessPath} <= ${bind(operand)}`
+          : `${accessPath} <= ${bind(operand)}`;
 
       case "$in": {
         if (!Array.isArray(operand) || operand.length === 0) return "FALSE";
@@ -580,7 +720,7 @@ export class MongoToPG {
         }
 
         const op = flags.includes("i") ? "~*" : "~";
-        return `${accessPath} ${op} ${sqlVal(pattern)}`;
+        return `${accessPath} ${op} ${bind(pattern)}`;
       }
 
       case "$mod":
@@ -590,7 +730,7 @@ export class MongoToPG {
           typeof operand[0] === "number" &&
           typeof operand[1] === "number"
         ) {
-          return `${numericAccessPath} % ${sqlVal(operand[0])} = ${sqlVal(operand[1])}`;
+          return `${numericAccessPath} % ${bind(operand[0])} = ${bind(operand[1])}`;
         }
         console.warn("Invalid $mod operand: requires [divisor, remainder]");
         return "FALSE";
@@ -612,7 +752,7 @@ export class MongoToPG {
           return "FALSE";
         }
         if (operand.length === 0) return "TRUE";
-        return `${jsonPath} @> ${sqlVal(operand)}::jsonb`;
+        return `${jsonPath} @> ${bind(operand)}::jsonb`;
 
       case "$elemMatch": {
         if (typeof operand !== "object" || operand === null) {
@@ -672,20 +812,22 @@ export class MongoToPG {
           console.warn(`Unsupported $type operand: ${operand}`);
           return "FALSE";
         }
-        return `jsonb_typeof(${jsonPath}) = ${sqlVal(pgType)}`;
+        return `jsonb_typeof(${jsonPath}) = ${bind(pgType)}`;
       }
 
-      case "$search":
-        console.warn(
-          "Unsupported operator: $search (part of $text, requires FTS configuration)",
-        );
-        // Return empty string instead of TRUE for unsupported ops
+      case "$ieq":
+        // case-insensitive equality; lower(data->>'f') is also the form an
+        // expression index on lower() matches
+        if (typeof operand !== "string")
+          throw new QueryError("$ieq requires a string");
+        return `lower(${accessPath}) = lower(${this.#addParam(operand)})`;
+
+      case "$options":
+        // flags for a sibling $regex, read there
         return "";
 
       default:
-        console.warn(`Unsupported operator: ${operator}`);
-        // Return empty string instead of TRUE for unsupported ops
-        return "";
+        throw new QueryError(`unsupported operator: ${operator}`);
     }
   }
 
@@ -698,10 +840,8 @@ export class MongoToPG {
     switch (operator) {
       case "$and":
       case "$or": {
-        if (!Array.isArray(operands)) {
-          console.warn(`Invalid operand for ${operator}: expected an array`);
-          return operator === "$and" ? "TRUE" : "FALSE";
-        }
+        if (!Array.isArray(operands))
+          throw new QueryError(`${operator} requires an array`);
         if (operands.length === 0) {
           return operator === "$and" ? "TRUE" : "FALSE";
         }
@@ -756,10 +896,8 @@ export class MongoToPG {
         return `NOT (${innerCondition})`;
       }
       case "$nor": {
-        if (!Array.isArray(operands)) {
-          console.warn("Invalid operand for $nor: expected an array");
-          return "TRUE";
-        }
+        if (!Array.isArray(operands))
+          throw new QueryError("$nor requires an array");
         if (operands.length === 0) {
           return "TRUE";
         }
@@ -822,20 +960,14 @@ export class MongoToPG {
     );
   }
 
-  #sqlValue(value: any): string {
-    if (value === undefined || value === null) {
-      return "NULL";
-    }
-    if (typeof value === "string") {
-      return `'${value.replace(/'/g, "''")}'`;
-    }
-    if (typeof value === "number" || typeof value === "boolean") {
-      return String(value);
-    }
-    if (Array.isArray(value)) {
-      return `'${JSON.stringify(value)}'`;
-    }
-    return `'${JSON.stringify(value)}'`;
+  // Bind an operand as a parameter. Operands can come from client-supplied
+  // filter JSON, so none may be spliced into the SQL text. Arrays and objects
+  // bind as their JSON text.
+  #bindValue(value: any): string {
+    if (value === undefined) return this.#addParam(null);
+    if (typeof value === "object" && value !== null)
+      return this.#addParam(JSON.stringify(value));
+    return this.#addParam(value);
   }
 
   #buildSortClause(
@@ -849,6 +981,13 @@ export class MongoToPG {
       // Convert 1 / -1 back to ASC / DESC
       const pgDirection = direction === 1 ? "ASC" : "DESC";
 
+      if (key === "$natural") return `id ${pgDirection}`;
+      if (key === "$textScore") {
+        if (!this.#textQuery)
+          throw new QueryError("$textScore sort requires a $text filter");
+        return `ts_rank(${this.#textVector(jsonField)}, ${this.#textQuery}) ${pgDirection}`;
+      }
+
       let accessPath = "";
       if (key.includes(".")) {
         const parts = key.split(".");
@@ -861,25 +1000,21 @@ export class MongoToPG {
           if (isNumericIndex) {
             currentPath += `->${part}`;
           } else {
-            currentPath += `->'${part}'`;
+            currentPath += `->'${this.#escapeKey(part)}'`;
           }
 
           if (isLastPart) {
-            const basePathMatch = currentPath.match(/^(.*)(->'[^']+'|->\d+)$/);
-            const basePath = basePathMatch ? basePathMatch[1] : jsonField;
-            if (isNumericIndex) {
-              accessPath = `${basePath}->>${part}`;
-            } else {
-              accessPath = `${basePath}->>'${part}'`;
-            }
+            // sort on the jsonb value (`->`), not its text form (`->>`):
+            // text extraction ordered numbers lexicographically ("9" > "80")
+            accessPath = currentPath;
           }
         }
-        if (!accessPath) accessPath = `${jsonField}->>'${key}'`;
+        if (!accessPath) accessPath = `${jsonField}->'${this.#escapeKey(key)}'`;
       } else {
-        accessPath = `${jsonField}->>'${key}'`;
+        accessPath = `${jsonField}->'${this.#escapeKey(key)}'`;
       }
 
-      return `${accessPath} ${pgDirection}`;
+      return `${accessPath} ${pgDirection} NULLS LAST`;
     });
     return ` ORDER BY ${sortClauses.join(", ")}`;
   }
@@ -888,20 +1023,36 @@ export class MongoToPG {
     // Convert dot notation 'a.b.c' to Postgres jsonb path literal '{ "a", "b", "c" }'
     // Use JSON.stringify for robust quoting of path segments
     const segments = fieldPath.split(".").map((p) => JSON.stringify(p));
-    // Return the literal directly, wrapped in single quotes for SQL
-    return `'{${segments.join(",")}}'`;
+    // Return the literal directly, wrapped in single quotes for SQL; embedded
+    // single quotes are doubled so a key cannot end the literal
+    return `'{${segments.join(",").replace(/'/g, "''")}}'`;
   }
 
-  #buildJsonbAccessPath(fieldPath: string, jsonField: string): string {
-    const parts = fieldPath.split(".");
-    let currentPath = this.#quoteIdent(jsonField);
-    for (let i = 0; i < parts.length; i++) {
-      const part = parts[i];
-      const quotedPart = this.#quoteLiteral(part);
-      const isLast = i === parts.length - 1;
-      currentPath += isLast ? `->>${quotedPart}` : `->${quotedPart}`;
-    }
-    return currentPath;
+  // find({ select }): only the named top-level fields, rebuilt as the json
+  // column so row handling stays the same
+  #projection(fields: string[], jsonField: string): string {
+    if (!Array.isArray(fields) || !fields.length)
+      throw new QueryError("select requires at least one field");
+    // jsonb_build_object takes at most 100 arguments, two per field
+    if (fields.length > 50)
+      throw new QueryError("select takes at most 50 fields");
+    const column = this.#quoteIdent(jsonField);
+    const pairs = fields.map((field) => {
+      if (typeof field !== "string" || field.includes("."))
+        throw new QueryError(`select takes top-level fields: ${field}`);
+      const key = this.#escapeKey(field);
+      return `'${key}', ${column}->'${key}'`;
+    });
+    return `jsonb_build_object(${pairs.join(", ")}) AS ${column}`;
+  }
+
+  // the tsvector $text matches and ranks against. Kept textually identical
+  // to the expression a GIN index would be built on, so the index serves it.
+  #textVector(jsonField: string): string {
+    const parts = (this.#textFields ?? []).map(
+      (field) => `coalesce(${jsonField}->>'${this.#escapeKey(field)}', '')`,
+    );
+    return `to_tsvector('english', ${parts.join(" || ' ' || ")})`;
   }
 
   #quoteIdent(ident: string): string {
@@ -910,5 +1061,12 @@ export class MongoToPG {
 
   #quoteLiteral(value: string): string {
     return `'${value.replace(/'/g, "''")}'`;
+  }
+
+  // escape a user-supplied JSON key for safe interpolation between single
+  // quotes in a jsonb path (data->'<key>'). doubles embedded single quotes so
+  // a filter/sort key can never break out of the string literal (SQL injection).
+  #escapeKey(key: string): string {
+    return key.replace(/'/g, "''");
   }
 }

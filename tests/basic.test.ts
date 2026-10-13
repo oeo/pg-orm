@@ -616,4 +616,40 @@ describe("PostgreSQL ORM", () => {
     const nestedIncA2 = await User.find1(userA._id);
     expect((nestedIncA2 as any)?.profile?.score).toBe(15); // Should be incremented
   });
+
+  test("create() always inserts, ignoring a supplied _vers", async () => {
+    const victim = await User.create({
+      name: "Victim",
+      email: "v@example.com",
+    });
+
+    await expect(
+      User.create({
+        _id: victim._id,
+        _vers: victim._vers,
+        name: "Overwritten",
+        email: "o@example.com",
+      } as any),
+    ).resolves.toMatchObject({ _vers: 1 });
+
+    const rows = await User.find(
+      { _id: victim._id },
+      { sort: { $natural: 1 } },
+    );
+    expect(rows.map((row) => row.name)).toEqual(["Victim", "Overwritten"]);
+  });
+
+  test("isModified(path) detects direct assignment", async () => {
+    const user = await User.create({ name: "Mod", email: "mod@example.com" });
+    const loaded = await User.find1(user._id);
+    if (!loaded) throw new Error("User not found");
+
+    expect(loaded.isModified("name")).toBe(false);
+    loaded.name = "Changed";
+    expect(loaded.isModified("name")).toBe(true);
+    expect(loaded.isModified("email")).toBe(false);
+
+    await loaded.save();
+    expect(loaded.isModified("name")).toBe(false);
+  });
 });

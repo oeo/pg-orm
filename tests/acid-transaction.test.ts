@@ -6,7 +6,7 @@ import {
   afterAll,
   beforeEach,
 } from "bun:test";
-import { defineSchema, transaction } from "../lib";
+import { defineSchema, events, transaction } from "../lib";
 import { ensureDatabase, getConnection } from "../lib/connection";
 import type { SchemaDefinition } from "../lib/types";
 
@@ -113,27 +113,54 @@ describe("ACID Transactions", () => {
     expect(charlieFinal).not.toBeNull();
   });
 
-  test("nested transactions should work (flattened/reused client)", async () => {
-    // Current implementation reuses client?
-    // Let's check connection.ts.
-    // transaction() calls getConnection(), gets global pool, calls connect().
-    // It creates a NEW client for every transaction call unless we modify logic.
-    // AND it runs `transactionContext.run(client, ...)`
-    // If we call transaction() inside transaction(), it will:
-    // 1. Outer: gets new client A. runs in context A.
-    // 2. Inner: calls getConnection().
-    //    Current implementation of getConnection():
-    //    const client = transactionContext.getStore();
-    //    if (client) return client;
-    //    return DatabaseManager.getConnection();
-    // So inner transaction calls getConnection(), gets client A.
-    // Then it calls `client.connect()`.
-    // Wait. `PoolClient` (from pg) does NOT have `connect()`. `Pool` has `connect()` returning `PoolClient`.
-    // `PoolClient` has `release()`, `query()`, etc.
-    // Issue: `transaction` function expects `db` to be a `Pool` (has `.connect()`).
-    // But `getConnection` now returns `Pool | PoolClient`.
-    // If it returns a `PoolClient`, calling `.connect()` on it might fail or behaves differently?
-    // `PoolClient` does NOT have `.connect()`.
-    // FIX REQUIRED in `lib/connection.ts`: `transaction` function needs to handle if `db` is already a client.
+  test("nested transactions join the outer one", async () => {
+    const attempt = transaction(async () => {
+      await transaction(async () => {
+        await Account.create({ name: "Inner", balance: 2 });
+      });
+      throw new Error("Outer Fail");
+    });
+
+    await expect(attempt).rejects.toThrow("Outer Fail");
+    expect(await Account.count()).toBe(0);
+  });
+
+  test("a caught inner failure still rolls back the outer transaction", async () => {
+    const attempt = transaction(async () => {
+      await Account.create({ name: "Dana", balance: 400 });
+      try {
+        await transaction(async () => {
+          throw new Error("Inner Fail");
+        });
+      } catch {
+        // swallowed on purpose: there is no savepoint to return to
+      }
+    });
+
+    await expect(attempt).rejects.toThrow("Inner Fail");
+    expect(await Account.findOne({ name: "Dana" })).toBeNull();
+  });
+
+  test("events fire after commit with a detached copy, and not on rollback", async () => {
+    const created: any[] = [];
+    const listener = (doc: any) => created.push(doc);
+    events.on("acid_accounts:created", listener);
+    try {
+      let live: any;
+      await transaction(async () => {
+        live = await Account.create({ name: "Erin", balance: 500 });
+        expect(created).toHaveLength(0);
+      });
+      expect(created.map((doc) => doc.name)).toEqual(["Erin"]);
+      expect(created[0]).not.toBe(live);
+
+      await transaction(async () => {
+        await Account.create({ name: "Frank", balance: 600 });
+        throw new Error("Intentional Fail");
+      }).catch(() => {});
+      expect(created).toHaveLength(1);
+    } finally {
+      events.off("acid_accounts:created", listener);
+    }
   });
 });

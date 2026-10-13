@@ -1,13 +1,30 @@
-export { defineSchema } from "./schema";
+export {
+  advisoryLock,
+  afterCommit,
+  events,
+  getConnection,
+  inTransaction,
+  registeredModels,
+  transaction,
+  withoutTransaction,
+} from "./connection";
 export { Document, OptimisticLockError } from "./document";
-export { events, transaction } from "./connection";
+export { QueryError } from "./mongo-converter";
+export { defineSchema } from "./schema";
 export type {
-  SchemaDefinition,
-  FieldConfig,
-  ValidationFunction,
+  AggregateField,
+  AggregateOptions,
   DefaultFunction,
+  FieldConfig,
   FindOptions,
+  InferSchemaType,
+  LockMode,
+  ModelStaticMethods,
+  SchemaDefinition,
+  SchemaOptions,
   SortDirection,
   SortOptions,
-  InferSchemaType,
+  UpdateManyOptions,
+  UpdateResult,
+  ValidationFunction,
 } from "./types";
