@@ -597,7 +597,7 @@ describe("MongoToPG", () => {
 
   test("should handle $elemMatch on array of primitives", () => {
     const query = { scores: { $elemMatch: { $gte: 95 } } };
-    const expectedSql = `SELECT "data" FROM "reports" WHERE EXISTS (SELECT 1 FROM jsonb_array_elements_text(data->'scores') as elem_val WHERE (elem_val.value)::numeric >= $1)`;
+    const expectedSql = `SELECT "data" FROM "reports" WHERE EXISTS (SELECT 1 FROM jsonb_array_elements(data->'scores') as elem WHERE ((elem #>> '{}'))::numeric >= $1)`;
     const { sql } = converter.buildSelectQueryAndParams("reports", query);
     expect(sql).toBe(expectedSql);
   });
@@ -751,7 +751,7 @@ describe("MongoToPG", () => {
       },
     };
     // $eq uses parameters
-    const expectedSql = `SELECT "data" FROM "tickets" WHERE NOT (EXISTS (SELECT 1 FROM jsonb_array_elements_text(data->'tags') as elem_val WHERE elem_val.value = $1))`;
+    const expectedSql = `SELECT "data" FROM "tickets" WHERE NOT (EXISTS (SELECT 1 FROM jsonb_array_elements(data->'tags') as elem WHERE (elem #>> '{}') = $1))`;
     const { sql } = converter.buildSelectQueryAndParams("tickets", query);
     expect(sql).toBe(expectedSql);
   });
@@ -943,7 +943,7 @@ describe("MongoToPG", () => {
       scores: { $elemMatch: { $gt: 1, $lt: 5 } },
     });
     expect(sql).toBe(
-      `SELECT "data" FROM "reports" WHERE EXISTS (SELECT 1 FROM jsonb_array_elements_text(data->'scores') as elem_val WHERE (elem_val.value)::numeric > $1 AND (elem_val.value)::numeric < $2)`,
+      `SELECT "data" FROM "reports" WHERE EXISTS (SELECT 1 FROM jsonb_array_elements(data->'scores') as elem WHERE ((elem #>> '{}'))::numeric > $1 AND ((elem #>> '{}'))::numeric < $2)`,
     );
     expect(params).toEqual([1, 5]);
   });
@@ -963,5 +963,37 @@ describe("MongoToPG", () => {
     expect(build({ limit: 5, offset: 10 })).toBe(
       `SELECT "data" FROM "t" LIMIT 5 OFFSET 10`,
     );
+  });
+
+  test("a primitive $elemMatch gives every operator the element as its path", () => {
+    const inner = (operand: Record<string, any>) => {
+      const { whereClause } = converter.buildWhereClauseAndParams({
+        t: { $elemMatch: operand },
+      });
+      return whereClause.replace(
+        /^WHERE EXISTS \(SELECT 1 FROM jsonb_array_elements\(data->'t'\) as elem WHERE (.*)\)$/,
+        "$1",
+      );
+    };
+
+    expect(inner({ $eq: null })).toBe("(elem IS NULL OR elem = 'null'::jsonb)");
+    expect(inner({ $exists: true })).toBe("elem IS NOT NULL");
+    expect(inner({ $type: "string" })).toBe("jsonb_typeof(elem) = $1");
+    expect(inner({ $size: 2 })).toBe(
+      "(jsonb_typeof(elem) = 'array' AND jsonb_array_length(elem) = 2)",
+    );
+    expect(inner({ $eq: "x" })).toBe("(elem #>> '{}') = $1");
+  });
+
+  test("update placeholders continue after seeded params", () => {
+    const built = converter.buildUpdateSetExpressionAndParams(
+      { $set: { a$10b: 1 }, $inc: { "n.$1": 2 } },
+      "data",
+      ["p1", "p2"],
+    );
+    expect(built?.expression).toBe(
+      `jsonb_set_lax(jsonb_set_lax("data"::jsonb, '{"a$10b"}', $3::jsonb, true)::jsonb, '{"n","$1"}', to_jsonb(COALESCE(("data"->'n'->'$1')::numeric, 0) + $4::numeric), true)`,
+    );
+    expect(built?.params).toEqual(["p1", "p2", "1", 2]);
   });
 });

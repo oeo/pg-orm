@@ -205,13 +205,16 @@ export class MongoToPG {
 
   /**
    * Converts MongoDB update operators to a parameterized PostgreSQL JSONB SET expression.
+   * Placeholders continue after `params`, which are returned first, so the
+   * expression shares one statement with a filter without renumbering.
    * @returns Object containing { expression: string, params: any[] } or null.
    */
   buildUpdateSetExpressionAndParams(
     updateOps: Record<string, any>,
     jsonField: string = "data",
+    params: any[] = [],
   ): { expression: string; params: any[] } | null {
-    this.#params = [];
+    this.#params = [...params];
     let currentExpression = this.#quoteIdent(jsonField);
     let appliedOps = 0;
     for (const [operator, ops] of Object.entries(updateOps)) {
@@ -801,23 +804,12 @@ export class MongoToPG {
         const isPrimitiveMatch =
           allKeysAreOperators && !containsLogicalOperator;
 
-        let elemMatchConditions = "";
-        let alias = "elem";
-        let arrayElementsFunc = "jsonb_array_elements";
-
-        if (isPrimitiveMatch) {
-          arrayElementsFunc = "jsonb_array_elements_text";
-          alias = "elem_val";
-          // Pass null for jsonPath here as we are operating on extracted text primitive
-          elemMatchConditions = this.#processFieldOperators(
-            operand,
-            `${alias}.value`,
-            null as any,
-          );
-        } else {
-          // Pass alias as the jsonField context for processing nested object
-          elemMatchConditions = this.#processQueryObject(operand, alias, ""); // Changed jsonField to alias, parentPath to ''
-        }
+        // each element is a jsonb value: operators on the element itself
+        // read its text as `elem #>> '{}'`, field filters read `elem->'key'`
+        const alias = "elem";
+        const elemMatchConditions = isPrimitiveMatch
+          ? this.#processFieldOperators(operand, `(${alias} #>> '{}')`, alias)
+          : this.#processQueryObject(operand, alias, "");
 
         if (elemMatchConditions === "FALSE") return "FALSE";
         if (!elemMatchConditions || elemMatchConditions === "TRUE") {
@@ -825,7 +817,7 @@ export class MongoToPG {
           return `(${jsonPath} IS NOT NULL AND jsonb_typeof(${jsonPath}) = 'array' AND jsonb_array_length(${jsonPath}) > 0)`;
         }
 
-        return `EXISTS (SELECT 1 FROM ${arrayElementsFunc}(${jsonPath}) as ${alias} WHERE ${elemMatchConditions})`;
+        return `EXISTS (SELECT 1 FROM jsonb_array_elements(${jsonPath}) as ${alias} WHERE ${elemMatchConditions})`;
       }
 
       case "$type": {
