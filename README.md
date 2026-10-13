@@ -328,6 +328,13 @@ These differ from earlier versions:
   row by construction, such as `{ $and: [{}] }` or `{ f: { $nin: [] } }`.
   Pass a real predicate, for example `{ _id: { $exists: true } }`.
 - `limit` and `offset` must be non-negative integers; `0` means none.
+- An `$elemMatch` that holds only operators, such as
+  `{ scores: { $elemMatch: { $gte: 95 } } }`, applies every operator to each
+  element. `$eq: null` matches only arrays that contain null; it used to
+  match every non-empty array. `$exists`, `$type`, `$size`, and a nested
+  `$elemMatch` now work there.
+- An update key that contains `$` followed by digits, such as `a$10b`, is
+  written as given. It used to be written under a shifted number.
 - Sorting compares JSON values, so numbers order numerically, and documents
   missing the field sort last. It used to compare their text.
 - Events fire after commit with a detached copy of the document. Listeners
