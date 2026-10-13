@@ -142,4 +142,20 @@ describe("Soft Deletes", () => {
     const rawCount = await SoftItem.count({}, { includeDeleted: true });
     expect(rawCount).toBe(2);
   });
+
+  test("bulk remove refuses a filter with no real condition", async () => {
+    await SoftItem.create({ name: "Keep A" });
+    await SoftItem.create({ name: "Keep B" });
+
+    // the soft-delete condition alone must not count as a filter
+    for (const filter of [{ $and: [{}] }, { name: { $nin: [] } }]) {
+      await expect(SoftItem.remove(filter)).rejects.toThrow(
+        "requires a filter that selects rows",
+      );
+    }
+    await expect(SoftItem.remove({ name: { $options: "i" } })).rejects.toThrow(
+      "$options requires $regex",
+    );
+    expect(await SoftItem.count()).toBe(2);
+  });
 });

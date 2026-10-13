@@ -2,7 +2,7 @@
 // numeric sort order and the comparison operands that are bound as parameters.
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { defineSchema } from "../lib";
+import { defineSchema, QueryError } from "../lib";
 
 const Probe = defineSchema("orm_operator_probe", {
   label: { type: "string", required: true },
@@ -71,7 +71,54 @@ describe("bound operands", () => {
     ]);
   });
 
+  test("an empty $in beside another condition matches nothing", async () => {
+    expect(await Probe.find({ label: "a", tags: { $in: [] } })).toEqual([]);
+    expect(
+      labels(
+        await Probe.find({ $or: [{ label: "a" }, { tags: { $in: [] } }] }),
+      ),
+    ).toEqual(["a"]);
+  });
+
   test("a quote in a dotted key keeps its parent path", async () => {
     expect(labels(await Probe.find({ "meta.o'k": "x" }))).toEqual(["a"]);
+  });
+});
+
+describe("bulk writes refuse a filter that selects every row by construction", () => {
+  const unselective: Record<string, any>[] = [
+    { $and: [{}] },
+    { label: { $nin: [] } },
+    { $or: [{}, { label: "a" }] },
+    { $nor: [{ label: { $in: [], $gt: "a" } }] },
+    { tags: { $not: { $elemMatch: { $in: [] } } } },
+  ];
+  const malformed: Record<string, any>[] = [
+    { label: { $options: "i" } },
+    { label: { $nin: "x" } },
+    { label: { $not: { $in: "x" } } },
+  ];
+
+  test("remove, updateOne and updateMany reject and change nothing", async () => {
+    for (const filter of [...unselective, ...malformed]) {
+      const set = { $set: { count: -1 } };
+      await expect(Probe.remove(filter)).rejects.toBeInstanceOf(QueryError);
+      await expect(Probe.updateOne(filter, set)).rejects.toBeInstanceOf(
+        QueryError,
+      );
+      await expect(Probe.updateMany(filter, set)).rejects.toBeInstanceOf(
+        QueryError,
+      );
+    }
+    expect(await Probe.count()).toBe(5);
+    expect(await Probe.count({ count: -1 })).toBe(0);
+  });
+
+  test("a real predicate that matches every row still works", async () => {
+    const result = await Probe.updateMany(
+      { _id: { $exists: true } },
+      { $set: { seen: true } },
+    );
+    expect(result.modifiedCount).toBe(5);
   });
 });
